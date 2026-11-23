@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: wheel_maintenance_cloud_api
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://wheel_admin:StrongPassword_2026@postgres:5432/wheel_maintenance_db
+      - JWT_SECRET=wheel_secret_jwt_key_9f8d7e6c5b4a3_replace_with_random_string_2026
+      - JWT_EXPIRES_IN=30d
+      - BODY_LIMIT=25mb
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - wheel_network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: wheel_maintenance_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: wheel_admin
+      POSTGRES_PASSWORD: StrongPassword_2026
+      POSTGRES_DB: wheel_maintenance_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "127.0.0.1:5432:5432" # مغلق خارجياً، متاح فقط محلياً للأمان
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wheel_admin -d wheel_maintenance_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - wheel_network
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  wheel_network:
+    driver: bridge
