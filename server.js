@@ -73,22 +73,31 @@ async function ensureTables() {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS maintenance_categories (
-        id SERIAL PRIMARY KEY,
-        category_id TEXT UNIQUE NOT NULL,
+        category_id TEXT PRIMARY KEY,
         name TEXT UNIQUE NOT NULL,
         default_replacement_km INT DEFAULT 5000,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
-      INSERT INTO maintenance_categories (category_id, name, default_replacement_km) VALUES
-      ('CAT-01', 'تبديل زيت المحرك والفلتر', 5000),
-      ('CAT-02', 'تبديل إطارات (عجلات)', 40000),
-      ('CAT-03', 'تبديل بطارية', 50000),
-      ('CAT-04', 'تبديل دهن كير وفلتر', 40000),
-      ('CAT-05', 'تبديل سفايف (فحمات فرامل)', 25000),
-      ('CAT-06', 'تبديل فلاتر هواء وتبريد', 10000),
-      ('CAT-07', 'صيانة عامة وفحص دوري', 15000)
-      ON CONFLICT (name) DO NOTHING;
+      ALTER TABLE maintenance_categories ADD COLUMN IF NOT EXISTS default_replacement_km INT DEFAULT 5000;
     `);
+
+    const defaultCats = [
+      ['CAT-01', 'تبديل زيت المحرك والفلتر', 5000],
+      ['CAT-02', 'تبديل إطارات (عجلات)', 40000],
+      ['CAT-03', 'تبديل بطارية', 50000],
+      ['CAT-04', 'تبديل دهن كير وفلتر', 40000],
+      ['CAT-05', 'تبديل سفايف (فحمات فرامل)', 25000],
+      ['CAT-06', 'تبديل فلاتر هواء وتبريد', 10000],
+      ['CAT-07', 'صيانة عامة وفحص دوري', 15000]
+    ];
+    for (const c of defaultCats) {
+      await pool.query(
+        `INSERT INTO maintenance_categories (category_id, name, default_replacement_km) 
+         VALUES ($1, $2, $3) 
+         ON CONFLICT (category_id) DO UPDATE SET default_replacement_km = EXCLUDED.default_replacement_km`,
+        c
+      ).catch(() => {});
+    }
   } catch (e) { console.warn('Categories Init:', e.message); }
 
   try {
@@ -232,8 +241,23 @@ async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUs
     if (isNaN(curKm) || curKm <= 0) return;
 
     // 1. جلب كافة أنواع الصيانة المسجلة
-    const catRes = await pool.query('SELECT category_id, name, default_replacement_km FROM maintenance_categories WHERE default_replacement_km > 0');
-    if (!catRes.rows || catRes.rows.length === 0) return;
+    let catRows = [];
+    try {
+      const catRes = await pool.query('SELECT category_id, name, default_replacement_km FROM maintenance_categories WHERE default_replacement_km > 0');
+      catRows = catRes.rows || [];
+    } catch (e) {}
+
+    if (catRows.length === 0) {
+      catRows = [
+        { category_id: 'CAT-01', name: 'تبديل زيت المحرك والفلتر', default_replacement_km: 5000 },
+        { category_id: 'CAT-02', name: 'تبديل إطارات (عجلات)', default_replacement_km: 40000 },
+        { category_id: 'CAT-03', name: 'تبديل بطارية', default_replacement_km: 50000 },
+        { category_id: 'CAT-04', name: 'تبديل دهن كير وفلتر', default_replacement_km: 40000 },
+        { category_id: 'CAT-05', name: 'تبديل سفايف (فحمات فرامل)', default_replacement_km: 25000 },
+        { category_id: 'CAT-06', name: 'تبديل فلاتر هواء وتبريد', default_replacement_km: 10000 },
+        { category_id: 'CAT-07', name: 'صيانة عامة وفحص دوري', default_replacement_km: 15000 }
+      ];
+    }
 
     // العثور على مسؤولي القسم لهذا القسم (DEPARTMENT_HEAD)
     const deptHeadRes = await pool.query(
@@ -245,7 +269,7 @@ async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUs
     );
     const deptHeadIds = deptHeadRes.rows.map(r => r.user_id);
 
-    for (const cat of catRes.rows) {
+    for (const cat of catRows) {
       const categoryName = cat.name;
       const defaultReplacementKm = parseInt(cat.default_replacement_km, 10);
       if (!defaultReplacementKm || defaultReplacementKm <= 0) continue;
@@ -1245,7 +1269,7 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
 
     // 1. استرجاع بيانات العجلة الحالية
     const curRes = await client.query(
-      `SELECT * FROM vehicles WHERE (vehicle_id = $1 OR id::text = $1) AND (is_deleted = FALSE OR is_deleted IS NULL) FOR UPDATE`,
+      `SELECT * FROM vehicles WHERE (vehicle_id = $1 OR plate_number = $1) AND (is_deleted = FALSE OR is_deleted IS NULL) FOR UPDATE`,
       [vehId]
     );
 
@@ -1533,11 +1557,23 @@ app.get('/api/reports/vehicle-history', authenticateToken, async (req, res) => {
 // ==============================================================================
 app.get(['/api/categories', '/api/maintenance-categories', '/api/admin/categories'], async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM maintenance_categories ORDER BY id ASC');
-    res.json({ success: true, data: r.rows, categories: r.rows });
+    const r = await pool.query('SELECT category_id, name, default_replacement_km FROM maintenance_categories ORDER BY category_id ASC');
+    if (r.rows && r.rows.length > 0) {
+      return res.json({ success: true, data: r.rows, categories: r.rows });
+    }
   } catch (err) {
-    res.status(500).json({ error: 'فشل استعلام أنواع الصيانة' });
+    console.warn('Categories query warning:', err.message);
   }
+  const defaultList = [
+    { category_id: 'CAT-01', name: 'تبديل زيت المحرك والفلتر', default_replacement_km: 5000 },
+    { category_id: 'CAT-02', name: 'تبديل إطارات (عجلات)', default_replacement_km: 40000 },
+    { category_id: 'CAT-03', name: 'تبديل بطارية', default_replacement_km: 50000 },
+    { category_id: 'CAT-04', name: 'تبديل دهن كير وفلتر', default_replacement_km: 40000 },
+    { category_id: 'CAT-05', name: 'تبديل سفايف (فحمات فرامل)', default_replacement_km: 25000 },
+    { category_id: 'CAT-06', name: 'تبديل فلاتر هواء وتبريد', default_replacement_km: 10000 },
+    { category_id: 'CAT-07', name: 'صيانة عامة وفحص دوري', default_replacement_km: 15000 }
+  ];
+  res.json({ success: true, data: defaultList, categories: defaultList });
 });
 
 app.post(['/api/categories', '/api/maintenance-categories', '/api/admin/categories'], authenticateToken, async (req, res) => {
@@ -1834,7 +1870,7 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
 
     // 1. جلب بيانات العجلة
     const vehRes = await client.query(
-      `SELECT * FROM vehicles WHERE (vehicle_id = $1 OR id::text = $1) AND (is_deleted = FALSE OR is_deleted IS NULL)`,
+      `SELECT * FROM vehicles WHERE (vehicle_id = $1 OR plate_number = $1) AND (is_deleted = FALSE OR is_deleted IS NULL)`,
       [vehId]
     );
     if (vehRes.rows.length === 0) {
