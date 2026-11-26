@@ -67,7 +67,11 @@ async function ensureTables() {
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sender_name TEXT;
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_by JSONB DEFAULT '[]'::jsonb;
       CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+    `);
+  } catch (e) { console.warn('Notifications Table Init:', e.message); }
 
+  try {
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS maintenance_categories (
         id SERIAL PRIMARY KEY,
         category_id TEXT UNIQUE NOT NULL,
@@ -75,14 +79,6 @@ async function ensureTables() {
         default_replacement_km INT DEFAULT 5000,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
-
-      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
-      ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('USER', 'AUDITOR', 'ADMIN', 'DEPARTMENT_HEAD', 'Department_Head', 'MANAGEMENT', 'Management'));
-
-      INSERT INTO users (user_id, username, password_hash, full_name, department_id, unit, role, is_active, can_add_transaction)
-      VALUES ('USR-MGT-001', 'management', 'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3', 'الإدارة العامة والمتابعة', 'DEPT-000', 'مكتب المدير العام', 'MANAGEMENT', TRUE, FALSE)
-      ON CONFLICT (username) DO NOTHING;
-
       INSERT INTO maintenance_categories (category_id, name, default_replacement_km) VALUES
       ('CAT-01', 'تبديل زيت المحرك والفلتر', 5000),
       ('CAT-02', 'تبديل إطارات (عجلات)', 40000),
@@ -93,10 +89,34 @@ async function ensureTables() {
       ('CAT-07', 'صيانة عامة وفحص دوري', 15000)
       ON CONFLICT (name) DO NOTHING;
     `);
-    console.log('✅ Database schema verified (v6.0 notifications, categories & management ready)');
-  } catch (err) {
-    console.warn('DB Init Note:', err.message);
-  }
+  } catch (e) { console.warn('Categories Init:', e.message); }
+
+  try {
+    // إزالة قيود التحقق القديمة عن عمود role لتمكين دور MANAGEMENT
+    await pool.query(`
+      DO $$
+      DECLARE
+        r RECORD;
+      BEGIN
+        FOR r IN (
+          SELECT conname 
+          FROM pg_constraint 
+          WHERE conrelid = 'users'::regclass AND contype = 'c'
+        ) LOOP
+          EXECUTE 'ALTER TABLE users DROP CONSTRAINT IF EXISTS ' || quote_ident(r.conname);
+        END LOOP;
+      END $$;
+    `);
+  } catch (e) { console.warn('Drop Constraint Init:', e.message); }
+
+  try {
+    await pool.query(`
+      INSERT INTO users (user_id, username, password_hash, full_name, department_id, unit, role, is_active, can_add_transaction)
+      VALUES ('USR-MGT-001', 'management', 'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3', 'الإدارة العامة والمتابعة', 'DEPT-000', 'مكتب المدير العام', 'MANAGEMENT', TRUE, FALSE)
+      ON CONFLICT (username) DO UPDATE SET role = 'MANAGEMENT', password_hash = 'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3', is_active = TRUE;
+    `);
+    console.log('✅ Management user USR-MGT-001 ready');
+  } catch (e) { console.warn('Management User Init:', e.message); }
 }
 ensureTables();
 
