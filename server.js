@@ -154,7 +154,7 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
 // ==============================================================================
 // 2. تسجيل الدخول وإصدار رمز الدخول (Authentication - Login)
 // ==============================================================================
-app.post('/api/auth/login', async (req, res) => {
+app.post(['/api/auth/login', '/api/login'], async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -166,7 +166,7 @@ app.post('/api/auth/login', async (req, res) => {
       SELECT u.*, d.name as department_name 
       FROM users u
       LEFT JOIN departments d ON u.department_id = d.department_id
-      WHERE (u.user_id = $1 OR LOWER(u.username) = LOWER($1)) AND u.is_deleted = FALSE
+      WHERE (u.user_id = $1 OR LOWER(u.username) = LOWER($1)) AND (u.is_deleted = FALSE OR u.is_deleted IS NULL)
     `;
     const result = await pool.query(query, [cleanUser]);
 
@@ -176,7 +176,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    if (!user.is_active) {
+    if (user.is_active === false) {
       return res.status(403).json({ error: 'الحساب معطل من قبل مدير النظام' });
     }
 
@@ -192,26 +192,37 @@ app.post('/api/auth/login', async (req, res) => {
       full_name: user.full_name,
       role: user.role,
       department_id: user.department_id,
-      unit: user.unit,
-      is_department_manager: user.is_department_manager,
-      assigned_department_id: user.assigned_department_id,
-      can_add_transaction: user.can_add_transaction
+      department_name: user.department_name || '',
+      unit: user.unit || '',
+      is_department_manager: user.is_department_manager || false,
+      assigned_department_id: user.assigned_department_id || null,
+      can_add_transaction: user.can_add_transaction !== false
     };
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
-    await pool.query('UPDATE users SET last_login = NOW() WHERE user_id = $1', [user.user_id]);
+    try {
+      await pool.query('UPDATE users SET last_login_at = NOW() WHERE user_id = $1', [user.user_id]);
+    } catch (e1) {
+      try {
+        await pool.query('UPDATE users SET last_login = NOW() WHERE user_id = $1', [user.user_id]);
+      } catch (e2) {}
+    }
+
+    try {
+      await logAudit('USER_LOGIN', 'users', user.user_id, user.user_id, user.full_name, { ip: req.ip });
+    } catch (e3) {}
 
     delete user.password_hash;
     res.json({
       success: true,
       message: 'تم تسجيل الدخول بنجاح',
       token,
-      user
+      user: { ...user, ...payload }
     });
   } catch (err) {
     console.error('Login Error:', err);
-    res.status(500).json({ error: 'حدث خطأ في الخادم أثناء تسجيل الدخول' });
+    res.status(500).json({ error: 'حدث خطأ في الخادم أثناء تسجيل الدخول', details: err.message });
   }
 });
 
