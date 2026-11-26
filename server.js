@@ -34,25 +34,66 @@ const pool = new Pool({
   ssl: !isLocalhost ? { rejectUnauthorized: false } : false
 });
 
-// التحقق من وجود الجداول الأساسية والفهارس عند الإقلاع
+// دالة التحقق من صلاحيات الإدارة أو مدير النظام (ADMIN & MANAGEMENT)
+function isManagementOrAdmin(role) {
+  const r = (role || '').toUpperCase();
+  return r === 'ADMIN' || r === 'MANAGEMENT';
+}
+
+// التحقق من وجود الجداول الأساسية والفهارس عند الإقلاع (v6.0)
 async function ensureTables() {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notifications (
         id SERIAL PRIMARY KEY,
         notification_id TEXT UNIQUE NOT NULL,
-        user_id TEXT NOT NULL,
+        user_id TEXT,
         transaction_id TEXT,
         title TEXT NOT NULL,
         purpose TEXT DEFAULT 'إشعار',
         message TEXT NOT NULL,
         type TEXT DEFAULT 'INFO',
         is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        target_type TEXT DEFAULT 'TARGET_USER',
+        target_id TEXT,
+        sender_id TEXT,
+        sender_name TEXT,
+        read_by JSONB DEFAULT '[]'::jsonb
+      );
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS target_type TEXT DEFAULT 'TARGET_USER';
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS target_id TEXT;
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sender_id TEXT;
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sender_name TEXT;
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_by JSONB DEFAULT '[]'::jsonb;
+      CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+
+      CREATE TABLE IF NOT EXISTS maintenance_categories (
+        id SERIAL PRIMARY KEY,
+        category_id TEXT UNIQUE NOT NULL,
+        name TEXT UNIQUE NOT NULL,
+        default_replacement_km INT DEFAULT 5000,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
-      CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+
+      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+      ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('USER', 'AUDITOR', 'ADMIN', 'DEPARTMENT_HEAD', 'Department_Head', 'MANAGEMENT', 'Management'));
+
+      INSERT INTO users (user_id, username, password_hash, full_name, department_id, unit, role, is_active, can_add_transaction)
+      VALUES ('USR-MGT-001', 'management', 'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3', 'الإدارة العامة والمتابعة', 'DEPT-000', 'مكتب المدير العام', 'MANAGEMENT', TRUE, FALSE)
+      ON CONFLICT (username) DO NOTHING;
+
+      INSERT INTO maintenance_categories (category_id, name, default_replacement_km) VALUES
+      ('CAT-01', 'تبديل زيت المحرك والفلتر', 5000),
+      ('CAT-02', 'تبديل إطارات (عجلات)', 40000),
+      ('CAT-03', 'تبديل بطارية', 50000),
+      ('CAT-04', 'تبديل دهن كير وفلتر', 40000),
+      ('CAT-05', 'تبديل سفايف (فحمات فرامل)', 25000),
+      ('CAT-06', 'تبديل فلاتر هواء وتبريد', 10000),
+      ('CAT-07', 'صيانة عامة وفحص دوري', 15000)
+      ON CONFLICT (name) DO NOTHING;
     `);
-    console.log('✅ Database schema verified (notifications table ready)');
+    console.log('✅ Database schema verified (v6.0 notifications, categories & management ready)');
   } catch (err) {
     console.warn('DB Init Note:', err.message);
   }
@@ -116,18 +157,52 @@ async function logAudit(action, entityType, entityId, actorId, actorName, detail
   }
 }
 
-// دالة إرسال إشعار لمستخدم
-async function sendNotification(userId, txId, title, purpose, message, type = 'INFO') {
+// دالة إرسال إشعار لمستخدم أو فئة مستهدفة (v6.0)
+async function sendNotification(userId, txId, title, purpose, message, type = 'INFO', targetType = 'TARGET_USER', targetId = null, senderId = 'SYSTEM', senderName = 'النظام') {
   try {
     const notifId = 'NOTIF-' + crypto.randomUUID().slice(0, 8);
+    const finalTargetType = targetType || (userId === 'ALL' ? 'TARGET_ALL' : 'TARGET_USER');
+    const finalTargetId = targetId || userId || null;
     await pool.query(
-      `INSERT INTO notifications (notification_id, user_id, transaction_id, title, purpose, message, type, is_read, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, NOW())`,
-      [notifId, userId, txId, title, purpose, message, type]
+      `INSERT INTO notifications (
+        notification_id, user_id, transaction_id, title, purpose, message,
+        type, is_read, created_at, target_type, target_id, sender_id, sender_name, read_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, NOW(), $8, $9, $10, $11, '[]'::jsonb)`,
+      [notifId, finalTargetId || 'ALL', txId, title, purpose || 'إشعار', message, type, finalTargetType, finalTargetId, senderId, senderName]
     );
   } catch (e) {
     console.warn('Send Notification Warning:', e.message);
   }
+}
+
+// دالة حساب كم مستحق الصيانة القادم لنفس نوع الصيانة (Due KM Calculation Engine)
+async function calculateDueKm(wheelId, category, currentMileage) {
+  let defaultKm = 5000;
+  try {
+    const catRes = await pool.query('SELECT default_replacement_km FROM maintenance_categories WHERE LOWER(name) = LOWER($1)', [category]);
+    if (catRes.rows.length > 0) {
+      defaultKm = parseInt(catRes.rows[0].default_replacement_km, 10) || 5000;
+    }
+  } catch (e) {}
+
+  let baseKm = parseInt(currentMileage, 10) || 0;
+  try {
+    const prevTx = await pool.query(
+      `SELECT COALESCE(mileage, current_km, 0) as km 
+       FROM transactions 
+       WHERE (wheel_id = $1 OR $1 = ANY(vehicle_numbers)) 
+         AND LOWER(category) = LOWER($2) 
+         AND (is_deleted = FALSE OR is_deleted IS NULL)
+       ORDER BY mileage DESC, created_at DESC 
+       LIMIT 1`,
+      [wheelId, category]
+    );
+    if (prevTx.rows.length > 0 && prevTx.rows[0].km > 0) {
+      baseKm = parseInt(prevTx.rows[0].km, 10);
+    }
+  } catch (e) {}
+
+  return baseKm + defaultKm;
 }
 
 // ==============================================================================
@@ -145,7 +220,7 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
   res.json({
     status: 'online',
     system: 'Wheel Maintenance Cloud API',
-    version: '5.0.0 (Enterprise RBAC & Workflow)',
+    version: '6.0.0 (Management Role, Notifications & Fleet Reports)',
     database: dbStatus,
     timestamp: new Date().toISOString()
   });
@@ -264,11 +339,11 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     }
     const user = userRes.rows[0];
 
-    // حظر الإنشاء من المدقق أو الأدمن (المعاملات تُنشأ حصراً من قبل USER أو DEPARTMENT_HEAD)
+    // حظر الإنشاء من المدقق أو الإدارة أو الأدمن (المعاملات تُنشأ حصراً من قبل USER أو DEPARTMENT_HEAD)
     const normalizedRole = (user.role || '').toUpperCase();
-    if (normalizedRole === 'AUDITOR' || normalizedRole === 'ADMIN') {
+    if (normalizedRole === 'AUDITOR' || isManagementOrAdmin(normalizedRole)) {
       return res.status(403).json({ 
-        error: 'عذراً، لا يمكن للمدقق أو مدير النظام إنشاء معاملات صيانة؛ الإنشاء مخصص للمستخدمين الميدانيين ومسؤولي الأقسام فقط.' 
+        error: 'عذراً، لا يمكن للمدقق أو الإدارة أو مدير النظام إنشاء معاملات صيانة؛ الإنشاء مخصص للمستخدمين الميدانيين ومسؤولي الأقسام فقط.' 
       });
     }
 
@@ -302,7 +377,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
     if (vehCheck.rows.length > 0) {
       const existingVeh = vehCheck.rows[0];
-      if (existingVeh.department_id && existingVeh.department_id !== userDept && normalizedRole !== 'ADMIN') {
+      if (existingVeh.department_id && existingVeh.department_id !== userDept && !isManagementOrAdmin(normalizedRole)) {
         return res.status(403).json({ 
           error: `العجلة (${wheelId}) تابعة لقسم آخر، ولا يمكنك إنشاء معاملة لعجلات خارج قسمك.` 
         });
@@ -423,6 +498,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
              COALESCE(t.wheel_id, '') as plate_number,
              COALESCE(t.cost, 0) as maintenance_price,
              COALESCE(t.mileage, 0) as current_km,
+             COALESCE(t.mileage, 0) + COALESCE(mc.default_replacement_km, 5000) as due_km,
              COALESCE(t.description, '') as notes,
              u.full_name as user_name, 
              u.username,
@@ -432,6 +508,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
       LEFT JOIN users u ON t.user_id = u.user_id
       LEFT JOIN departments d ON t.department_id = d.department_id
       LEFT JOIN users c ON t.created_by = c.user_id
+      LEFT JOIN maintenance_categories mc ON LOWER(mc.name) = LOWER(t.category)
       WHERE t.is_deleted = FALSE
     `;
     const params = [];
@@ -480,8 +557,8 @@ app.post(['/api/auditor/transactions/:id/review', '/api/transactions/:id/review'
     const actor = req.user;
     const actorRole = (actor.role || '').toUpperCase();
 
-    if (actorRole !== 'AUDITOR' && actorRole !== 'ADMIN') {
-      return res.status(403).json({ error: 'عذراً، صلاحية تدقيق الوصولات مخصصة لحساب المدقق فقط.' });
+    if (actorRole !== 'AUDITOR' && !isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'عذراً، صلاحية تدقيق الوصولات مخصصة لحساب المدقق والإدارة فقط.' });
     }
 
     const txRes = await pool.query(`SELECT * FROM transactions WHERE transaction_id = $1 AND is_deleted = FALSE`, [txId]);
@@ -515,9 +592,9 @@ app.post(['/api/auditor/transactions/:id/review', '/api/transactions/:id/review'
         `تمت موافقة المدقق على معاملة العجلة [${tx.wheel_id}] وأُحيلت للإدارة للاعتماد المالي والإداري.`
       );
 
-      // إشعار لمديري النظام (Admins)
-      const admins = await pool.query(`SELECT user_id FROM users WHERE UPPER(role) = 'ADMIN' AND is_active = TRUE AND is_deleted = FALSE`);
-      for (const adm of admins.rows) {
+      // إشعار لمديري النظام والإدارة (Admins & Management)
+      const managers = await pool.query(`SELECT user_id FROM users WHERE UPPER(role) IN ('ADMIN', 'MANAGEMENT') AND is_active = TRUE AND is_deleted = FALSE`);
+      for (const adm of managers.rows) {
         await sendNotification(
           adm.user_id,
           txId,
@@ -569,17 +646,17 @@ app.post(['/api/auditor/transactions/:id/review', '/api/transactions/:id/review'
 });
 
 // ==============================================================================
-// 6. مسار الاعتماد المالي والإداري من الإدارة (Phase 3: Admin Final Approval)
+// 6. مسار الاعتماد المالي والإداري من الإدارة (Phase 3: Management & Admin Approval)
 // ==============================================================================
-app.post(['/api/admin/transactions/:id/review', '/api/transactions/:id/approve', '/api/admin/transactions/:id/status'], authenticateToken, async (req, res) => {
+app.post(['/api/admin/transactions/:id/review', '/api/management/transactions/:id/review', '/api/transactions/:id/approve', '/api/admin/transactions/:id/status'], authenticateToken, async (req, res) => {
   try {
     const txId = req.params.id;
     const { action, cost, maintenance_price, admin_note, note } = req.body;
     const actor = req.user;
     const actorRole = (actor.role || '').toUpperCase();
 
-    if (actorRole !== 'ADMIN') {
-      return res.status(403).json({ error: 'عذراً، صلاحية الاعتماد المالي وتحديد المبلغ والاعتماد النهائي محصورة بمدير النظام (ADMIN) فقط.' });
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'عذراً، صلاحية الاعتماد المالي وتحديد المبلغ والاعتماد النهائي محصورة بالإدارة (MANAGEMENT) ومدير النظام (ADMIN).' });
     }
 
     const txRes = await pool.query(`SELECT * FROM transactions WHERE transaction_id = $1 AND is_deleted = FALSE`, [txId]);
@@ -670,6 +747,118 @@ app.post(['/api/admin/transactions/:id/review', '/api/transactions/:id/approve',
   } catch (err) {
     console.error('Admin Review Error:', err);
     res.status(500).json({ error: 'حدث خطأ أثناء معالجة قرار الإدارة: ' + (err.message || err) });
+  }
+});
+
+// ==============================================================================
+// 6.1 التعديل الشامل للمعاملات (Full Transaction Edit - Admin & Management Only)
+// ==============================================================================
+app.put(['/api/transactions/:id', '/api/admin/transactions/:id'], authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'عذراً، صلاحية التعديل الشامل للمعاملات محصورة بالإدارة (MANAGEMENT) ومدير النظام (ADMIN).' });
+    }
+
+    const txId = req.params.id;
+    const existingRes = await pool.query('SELECT * FROM transactions WHERE transaction_id = $1', [txId]);
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'المعاملة غير موجودة' });
+    }
+
+    const {
+      wheel_id,
+      category,
+      mileage,
+      current_km,
+      cost,
+      maintenance_price,
+      notes,
+      description,
+      status,
+      department_id,
+      vehicle_images,
+      receipt_images,
+      receipt_image
+    } = req.body;
+
+    const finalMileage = parseInt(mileage !== undefined ? mileage : current_km, 10);
+    const finalCost = parseFloat(cost !== undefined ? cost : maintenance_price);
+    const finalVehImages = vehicle_images ? (typeof vehicle_images === 'string' ? vehicle_images : JSON.stringify(vehicle_images)) : undefined;
+    const finalReceiptImages = receipt_images ? (typeof receipt_images === 'string' ? receipt_images : JSON.stringify(receipt_images)) : undefined;
+
+    const updateFields = [];
+    const values = [];
+    let idx = 1;
+
+    if (wheel_id !== undefined) {
+      updateFields.push(`wheel_id = $${idx++}`);
+      values.push(wheel_id);
+      updateFields.push(`vehicle_numbers = $${idx++}::jsonb`);
+      values.push(JSON.stringify([wheel_id]));
+    }
+    if (category !== undefined) {
+      updateFields.push(`category = $${idx++}`);
+      values.push(category);
+    }
+    if (!isNaN(finalMileage)) {
+      updateFields.push(`mileage = $${idx++}`);
+      values.push(finalMileage);
+    }
+    if (!isNaN(finalCost)) {
+      updateFields.push(`cost = $${idx++}`);
+      values.push(finalCost);
+    }
+    if (notes !== undefined || description !== undefined) {
+      updateFields.push(`description = $${idx++}`);
+      values.push(notes !== undefined ? notes : description);
+    }
+    if (status !== undefined) {
+      updateFields.push(`status = $${idx++}`);
+      values.push(status);
+    }
+    if (department_id !== undefined) {
+      updateFields.push(`department_id = $${idx++}`);
+      values.push(department_id);
+    }
+    if (finalVehImages !== undefined) {
+      updateFields.push(`vehicle_images = $${idx++}::jsonb`);
+      values.push(finalVehImages);
+    }
+    if (finalReceiptImages !== undefined) {
+      updateFields.push(`receipt_images = $${idx++}::jsonb`);
+      values.push(finalReceiptImages);
+    }
+    if (receipt_image !== undefined) {
+      updateFields.push(`receipt_image = $${idx++}`);
+      values.push(receipt_image);
+    }
+
+    updateFields.push(`updated_at = NOW()`);
+    updateFields.push(`updated_by = $${idx++}`);
+    values.push(actor.id || actor.user_id);
+
+    values.push(txId);
+    const updateQuery = `
+      UPDATE transactions
+      SET ${updateFields.join(', ')}
+      WHERE transaction_id = $${idx}
+      RETURNING *
+    `;
+    const updatedRes = await pool.query(updateQuery, values);
+
+    await logAudit('FULL_TRANSACTION_EDIT', 'transactions', txId, actor.id || actor.user_id, actor.full_name || actor.username, req.body);
+
+    res.json({
+      success: true,
+      message: 'تم إجراء التعديل الشامل للمعاملة بنجاح ✏️',
+      transaction: updatedRes.rows[0],
+      data: updatedRes.rows[0]
+    });
+  } catch (err) {
+    console.error('Full Edit Error:', err);
+    res.status(500).json({ error: 'فشل التعديل الشامل للمعاملة', details: err.message });
   }
 });
 
@@ -909,12 +1098,12 @@ app.get(['/api/vehicles', '/api/admin/vehicles'], authenticateToken, async (req,
   }
 });
 
-// تعديل عجلة (Admin Only)
+// تعديل عجلة (Admin & Management)
 app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, async (req, res) => {
   try {
     const actor = req.user;
-    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
-      return res.status(403).json({ error: 'صلاحية تعديل العجلات محصورة بمدير النظام فقط' });
+    if (!isManagementOrAdmin(actor.role)) {
+      return res.status(403).json({ error: 'صلاحية تعديل العجلات محصورة بالإدارة ومدير النظام' });
     }
 
     const vehId = req.params.id;
@@ -967,12 +1156,12 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
   }
 });
 
-// إضافة عجلة جديدة (Admin Only)
+// إضافة عجلة جديدة (Admin & Management)
 app.post(['/api/vehicles', '/api/admin/vehicles', '/api/admin/vehicles/add'], authenticateToken, async (req, res) => {
   try {
     const actor = req.user;
-    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
-      return res.status(403).json({ error: 'صلاحية إضافة العجلات محصورة بمدير النظام فقط' });
+    if (!isManagementOrAdmin(actor.role)) {
+      return res.status(403).json({ error: 'صلاحية إضافة العجلات محصورة بالإدارة ومدير النظام' });
     }
 
     const { vehicle_id, id, plate_number, plate, vehicle_type, department_id, current_km, is_active } = req.body;
@@ -1005,40 +1194,95 @@ app.post(['/api/vehicles', '/api/admin/vehicles', '/api/admin/vehicles/add'], au
 });
 
 // ==============================================================================
-// 9. تقرير سجل صيانة العجلات الشامل للأدمن (Vehicle Maintenance Dossier)
+// 9. جدول وتقارير أسطول العجلات (Fleet Summary & Vehicle Dossier Reports)
 // ==============================================================================
+
+// تقرير ملخص أسطول العجلات (Vehicles Summary Table)
+app.get('/api/reports/vehicles-summary', authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    let deptFilter = '';
+    const params = [];
+
+    if (actorRole === 'DEPARTMENT_HEAD') {
+      const dept = actor.assigned_department_id || actor.department_id;
+      params.push(dept);
+      deptFilter = `WHERE v.department_id = $${params.length}`;
+    }
+
+    const query = `
+      SELECT 
+        v.plate_number,
+        v.vehicle_type,
+        v.department_id,
+        COALESCE(d.name, 'غير محدد') as department_name,
+        COALESCE(MAX(t.mileage), v.current_km, 0) as highest_km,
+        COALESCE(SUM(CASE WHEN t.status = 'AUDITED' THEN t.cost ELSE 0 END), 0) as total_maintenance_cost,
+        MAX(t.created_at) as last_maintenance_date,
+        COUNT(t.id) as transaction_count
+      FROM vehicles v
+      LEFT JOIN departments d ON v.department_id = d.department_id
+      LEFT JOIN transactions t ON (t.wheel_id = v.plate_number OR v.plate_number = ANY(t.vehicle_numbers)) AND (t.is_deleted = FALSE OR t.is_deleted IS NULL)
+      ${deptFilter}
+      GROUP BY v.vehicle_id, v.plate_number, v.vehicle_type, v.department_id, d.name, v.current_km
+      ORDER BY v.plate_number ASC
+    `;
+    const result = await pool.query(query, params);
+    res.json({
+      success: true,
+      data: result.rows,
+      summary: result.rows
+    });
+  } catch (err) {
+    console.error('Vehicles Summary Report Error:', err);
+    res.status(500).json({ error: 'فشل استخراج تقرير ملخص العجلات' });
+  }
+});
+
+// تقرير سجل صيانة العجلة التفصيلي (Vehicle Maintenance Dossier Report) مع حساب كم مستحق الصيانة
 app.get('/api/reports/vehicle-history', authenticateToken, async (req, res) => {
   try {
     const actor = req.user;
     const actorRole = (actor.role || '').toUpperCase();
-    if (actorRole !== 'ADMIN') {
-      return res.status(403).json({ error: 'عذراً، هذا التقرير مخصص لمدير النظام فقط' });
+    if (actorRole === 'USER') {
+      return res.status(403).json({ error: 'عذراً، هذا التقرير مخصص لمسؤولي الأقسام والإدارة فقط' });
     }
 
     const { wheel_id } = req.query;
+    if (!wheel_id) {
+      return res.status(400).json({ error: 'يرجى تحديد رقم العجلة لاستخراج التقرير' });
+    }
+
+    // تحقق من تبعية العجلة لقسم مسؤول القسم
+    if (actorRole === 'DEPARTMENT_HEAD') {
+      const userDept = actor.assigned_department_id || actor.department_id;
+      const vehCheck = await pool.query('SELECT department_id FROM vehicles WHERE plate_number = $1 OR vehicle_id = $1', [wheel_id.trim()]);
+      if (vehCheck.rows.length > 0 && vehCheck.rows[0].department_id !== userDept) {
+        return res.status(403).json({ error: 'عذراً، لا يمكنك استعراض تقرير عجلة تابعة لقسم آخر' });
+      }
+    }
 
     let query = `
       SELECT t.*, 
              COALESCE(t.cost, 0) as maintenance_price,
              COALESCE(t.mileage, 0) as current_km,
+             COALESCE(t.mileage, 0) as maintenance_km,
+             t.created_at as maintenance_date,
+             COALESCE(t.cost, 0) as maintenance_cost,
+             COALESCE(t.mileage, 0) + COALESCE(mc.default_replacement_km, 5000) as due_km,
+             COALESCE(t.description, '') as notes,
              u.full_name as user_name,
              d.name as department_name
       FROM transactions t
       LEFT JOIN users u ON t.user_id = u.user_id
       LEFT JOIN departments d ON t.department_id = d.department_id
-      WHERE t.is_deleted = FALSE
+      LEFT JOIN maintenance_categories mc ON LOWER(mc.name) = LOWER(t.category)
+      WHERE (t.wheel_id = $1 OR $1 = ANY(t.vehicle_numbers)) AND (t.is_deleted = FALSE OR t.is_deleted IS NULL)
+      ORDER BY t.created_at DESC
     `;
-    const params = [];
+    const txRes = await pool.query(query, [wheel_id.trim()]);
 
-    if (wheel_id && wheel_id.trim() !== '') {
-      params.push(wheel_id.trim());
-      query += ` AND t.wheel_id = $${params.length}`;
-    }
-
-    query += ` ORDER BY t.created_at DESC`;
-    const txRes = await pool.query(query, params);
-
-    // حساب الإحصائيات
     let totalCount = txRes.rows.length;
     let totalCost = 0;
     let lastKm = 0;
@@ -1058,9 +1302,10 @@ app.get('/api/reports/vehicle-history', authenticateToken, async (req, res) => {
         total_count: totalCount,
         total_cost: totalCost,
         last_km: lastKm,
-        wheel_id: wheel_id || 'ALL'
+        wheel_id: wheel_id.trim()
       },
-      transactions: txRes.rows
+      transactions: txRes.rows,
+      data: txRes.rows
     });
   } catch (err) {
     console.error('Vehicle History Report Error:', err);
@@ -1069,16 +1314,182 @@ app.get('/api/reports/vehicle-history', authenticateToken, async (req, res) => {
 });
 
 // ==============================================================================
-// 10. نظام الإشعارات الفورية (Notifications API)
+// 10. إدارة أنواع الصيانة والكم الافتراضي (Maintenance Categories API)
 // ==============================================================================
+app.get(['/api/categories', '/api/maintenance-categories'], async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM maintenance_categories ORDER BY id ASC');
+    res.json({ success: true, data: r.rows, categories: r.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل استعلام أنواع الصيانة' });
+  }
+});
+
+app.post(['/api/categories', '/api/maintenance-categories'], authenticateToken, async (req, res) => {
+  try {
+    const actorRole = (req.user.role || '').toUpperCase();
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'صلاحية إضافة أنواع الصيانة محصورة بالإدارة ومدير النظام' });
+    }
+    const { name, default_replacement_km } = req.body;
+    if (!name) return res.status(400).json({ error: 'اسم نوع الصيانة مطلوب' });
+    const catId = 'CAT-' + crypto.randomUUID().slice(0, 8);
+    const km = parseInt(default_replacement_km, 10) || 5000;
+    const r = await pool.query(
+      `INSERT INTO maintenance_categories (category_id, name, default_replacement_km, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING *`,
+      [catId, name.trim(), km]
+    );
+    res.json({ success: true, message: 'تمت إضافة نوع الصيانة بنجاح', data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل إضافة نوع الصيانة: ' + (err.message || err) });
+  }
+});
+
+app.put(['/api/categories/:id', '/api/maintenance-categories/:id'], authenticateToken, async (req, res) => {
+  try {
+    const actorRole = (req.user.role || '').toUpperCase();
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'صلاحية تعديل أنواع الصيانة محصورة بالإدارة ومدير النظام' });
+    }
+    const { name, default_replacement_km } = req.body;
+    const catId = req.params.id;
+    const km = parseInt(default_replacement_km, 10) || 5000;
+    const r = await pool.query(
+      `UPDATE maintenance_categories 
+       SET name = COALESCE($1, name), default_replacement_km = $2
+       WHERE category_id = $3 OR id::text = $3
+       RETURNING *`,
+      [name ? name.trim() : null, km, catId]
+    );
+    res.json({ success: true, message: 'تم تعديل نوع الصيانة بنجاح', data: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل تعديل نوع الصيانة' });
+  }
+});
+
+app.delete(['/api/categories/:id', '/api/maintenance-categories/:id'], authenticateToken, async (req, res) => {
+  try {
+    const actorRole = (req.user.role || '').toUpperCase();
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'صلاحية حذف أنواع الصيانة محصورة بالإدارة ومدير النظام' });
+    }
+    const catId = req.params.id;
+    await pool.query('DELETE FROM maintenance_categories WHERE category_id = $1 OR id::text = $1', [catId]);
+    res.json({ success: true, message: 'تم حذف نوع الصيانة بنجاح' });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل حذف نوع الصيانة' });
+  }
+});
+
+// ==============================================================================
+// 11. مركز وإدارة الإشعارات الفورية والموجهة (Notifications Center API)
+// ==============================================================================
+
+// إرسال إشعار موجه أو تعميم
+app.post('/api/notifications', authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    if (actorRole !== 'ADMIN' && actorRole !== 'MANAGEMENT' && actorRole !== 'DEPARTMENT_HEAD') {
+      return res.status(403).json({ error: 'غير مخول بإرسال الإشعارات' });
+    }
+
+    const { title, message, target_type, target_id } = req.body;
+    if (!title || !message) {
+      return res.status(400).json({ error: 'عنوان الإشعار ونص الرسالة مطلوبان' });
+    }
+
+    const finalTargetType = target_type || 'TARGET_ALL';
+    let finalTargetId = target_id || null;
+
+    if (actorRole === 'DEPARTMENT_HEAD') {
+      if (finalTargetType === 'TARGET_ALL') {
+        return res.status(403).json({ error: 'مسؤول القسم يمكنه استهداف قسمه أو موظفيه فقط' });
+      }
+      if (finalTargetType === 'TARGET_DEPARTMENT') {
+        finalTargetId = actor.assigned_department_id || actor.department_id;
+      }
+    }
+
+    const notifId = 'NOTIF-' + crypto.randomUUID().slice(0, 8);
+    const r = await pool.query(
+      `INSERT INTO notifications (
+        notification_id, title, message, target_type, target_id,
+        sender_id, sender_name, user_id, is_read, read_by, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, '[]'::jsonb, NOW())
+      RETURNING *`,
+      [
+        notifId,
+        title.trim(),
+        message.trim(),
+        finalTargetType,
+        finalTargetId,
+        actor.id || actor.user_id,
+        actor.full_name || actor.username,
+        finalTargetType === 'TARGET_USER' ? finalTargetId : (finalTargetId || 'ALL')
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: 'تم إرسال الإشعار بنجاح 🔔',
+      notification: r.rows[0],
+      data: r.rows[0]
+    });
+  } catch (err) {
+    console.error('Send Notification Error:', err);
+    res.status(500).json({ error: 'فشل إرسال الإشعار', details: err.message });
+  }
+});
+
+// استعلام قائمة الإشعارات
 app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
-    const actorId = req.user.id || req.user.user_id;
-    const notifs = await pool.query(
-      `SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100`,
-      [actorId]
-    );
-    res.json({ success: true, count: notifs.rows.length, notifications: notifs.rows });
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    const userId = actor.id || actor.user_id;
+    const deptId = actor.assigned_department_id || actor.department_id;
+
+    let query = `
+      SELECT * FROM notifications
+      WHERE 
+        target_type = 'TARGET_ALL'
+        OR (target_type = 'TARGET_DEPARTMENT' AND target_id = $1)
+        OR (target_type = 'TARGET_USER' AND target_id = $2)
+        OR user_id = $2
+        OR user_id = 'ALL'
+    `;
+    const params = [deptId, userId];
+
+    if (isManagementOrAdmin(actorRole)) {
+      query = `SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100`;
+      params.length = 0;
+    } else {
+      query += ` OR sender_id = $2 ORDER BY created_at DESC LIMIT 100`;
+    }
+
+    const result = await pool.query(query, params);
+    
+    // حساب المقروء للمستخدم
+    const formatted = result.rows.map(n => {
+      const readBy = Array.isArray(n.read_by) ? n.read_by : [];
+      const isReadByMe = n.is_read || readBy.includes(userId);
+      return {
+        ...n,
+        is_read_by_me: isReadByMe
+      };
+    });
+
+    const unreadCount = formatted.filter(n => !n.is_read_by_me).length;
+
+    res.json({
+      success: true,
+      unread_count: unreadCount,
+      notifications: formatted,
+      data: formatted
+    });
   } catch (err) {
     console.error('Fetch Notifications Error:', err);
     res.status(500).json({ error: 'فشل جلب الإشعارات' });
@@ -1087,13 +1498,19 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
 app.post('/api/notifications/:id/read', authenticateToken, async (req, res) => {
   try {
-    const actorId = req.user.id || req.user.user_id;
     const notifId = req.params.id;
+    const userId = req.user.id || req.user.user_id;
     await pool.query(
-      `UPDATE notifications SET is_read = TRUE WHERE notification_id = $1 AND user_id = $2`,
-      [notifId, actorId]
+      `UPDATE notifications 
+       SET is_read = TRUE,
+           read_by = CASE 
+             WHEN read_by @> jsonb_build_array($2::text) THEN read_by 
+             ELSE read_by || jsonb_build_array($2::text) 
+           END
+       WHERE notification_id = $1 OR id::text = $1`,
+      [notifId, userId]
     );
-    res.json({ success: true });
+    res.json({ success: true, message: 'تم تحديث حالة القراءة' });
   } catch (err) {
     res.status(500).json({ error: 'فشل تحديث حالة الإشعار' });
   }
@@ -1101,25 +1518,30 @@ app.post('/api/notifications/:id/read', authenticateToken, async (req, res) => {
 
 app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
   try {
-    const actorId = req.user.id || req.user.user_id;
+    const userId = req.user.id || req.user.user_id;
     await pool.query(
-      `UPDATE notifications SET is_read = TRUE WHERE user_id = $1`,
-      [actorId]
+      `UPDATE notifications 
+       SET is_read = TRUE,
+           read_by = CASE 
+             WHEN read_by @> jsonb_build_array($1::text) THEN read_by 
+             ELSE read_by || jsonb_build_array($1::text) 
+           END`,
+      [userId]
     );
-    res.json({ success: true });
+    res.json({ success: true, message: 'تم تعليم كافة الإشعارات كمقروءة' });
   } catch (err) {
     res.status(500).json({ error: 'فشل تحديث الإشعارات' });
   }
 });
 
 // ==============================================================================
-// 11. الحذف المنطقي وسلة المحذوفات (Soft Delete Pipeline)
+// 12. الحذف المنطقي وسلة المحذوفات (Soft Delete Pipeline)
 // ==============================================================================
 async function executeSoftDelete(req, res, { tableName, idColumn, entityType, recordId, successMsg }) {
   try {
     const actor = req.user;
-    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
-      return res.status(403).json({ error: 'ليس لديك صلاحية تنفيذ الحذف، الحذف محصور بمدير النظام' });
+    if (!isManagementOrAdmin(actor.role)) {
+      return res.status(403).json({ error: 'ليس لديك صلاحية تنفيذ الحذف، الحذف محصور بالإدارة ومدير النظام' });
     }
 
     const existing = await pool.query(
@@ -1203,6 +1625,10 @@ app.get(['/api/deleted-records', '/api/admin/recycle-bin'], authenticateToken, a
 
 app.post(['/api/deleted-records/:id/restore', '/api/admin/recycle-bin/restore'], authenticateToken, async (req, res) => {
   try {
+    const actorRole = (req.user.role || '').toUpperCase();
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'صلاحية الاستعادة محصورة بالإدارة ومدير النظام' });
+    }
     const recordPk = req.params.id || req.body.id || req.body.trashId;
     const delRes = await pool.query('SELECT * FROM deleted_records WHERE id = $1', [recordPk]);
     if (delRes.rows.length === 0) {
