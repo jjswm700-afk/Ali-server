@@ -219,7 +219,7 @@ async function calculateDueKm(wheelId, category, currentMileage) {
     const prevTx = await pool.query(
       `SELECT COALESCE(mileage, current_km, 0) as km 
        FROM transactions 
-       WHERE (wheel_id = $1 OR $1 = ANY(vehicle_numbers)) 
+       WHERE (wheel_id = $1 OR vehicle_numbers::text LIKE '%' || $1 || '%') 
          AND LOWER(category) = LOWER($2) 
          AND (is_deleted = FALSE OR is_deleted IS NULL)
        ORDER BY mileage DESC, created_at DESC 
@@ -278,7 +278,7 @@ async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUs
       const prevTx = await pool.query(
         `SELECT COALESCE(mileage, current_km, 0) as km 
          FROM transactions 
-         WHERE (wheel_id = $1 OR $1 = ANY(vehicle_numbers)) 
+         WHERE (wheel_id = $1 OR vehicle_numbers::text LIKE '%' || $1 || '%') 
            AND LOWER(category) = LOWER($2) 
            AND (is_deleted = FALSE OR is_deleted IS NULL)
          ORDER BY mileage DESC, created_at DESC 
@@ -1324,7 +1324,7 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
       const txTransferRes = await client.query(
         `UPDATE transactions 
          SET department_id = $1, updated_at = NOW() 
-         WHERE (wheel_id = $2 OR $2 = ANY(vehicle_numbers) OR wheel_id = $3)`,
+         WHERE (wheel_id = $2 OR vehicle_numbers::text LIKE '%' || $2 || '%' OR wheel_id = $3)`,
         [newDept, oldPlate, currentVeh.vehicle_id]
       );
       cascadedTransactionsCount = txTransferRes.rowCount || 0;
@@ -1350,7 +1350,7 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
                to_jsonb($1::text)
              ),
              updated_at = NOW() 
-         WHERE (wheel_id = $2 OR $2 = ANY(vehicle_numbers) OR wheel_id = $3)`,
+         WHERE (wheel_id = $2 OR vehicle_numbers::text LIKE '%' || $2 || '%' OR wheel_id = $3)`,
         [newPlate, oldPlate, currentVeh.vehicle_id]
       );
 
@@ -1464,7 +1464,7 @@ app.get(['/api/reports/vehicles-summary', '/api/vehicles/fleet-summary'], authen
         COUNT(t.id) as transaction_count
       FROM vehicles v
       LEFT JOIN departments d ON v.department_id = d.department_id
-      LEFT JOIN transactions t ON (t.wheel_id = v.plate_number OR v.plate_number = ANY(t.vehicle_numbers)) AND (t.is_deleted = FALSE OR t.is_deleted IS NULL)
+      LEFT JOIN transactions t ON (t.wheel_id = v.plate_number OR t.vehicle_numbers::text LIKE '%' || v.plate_number || '%') AND (t.is_deleted = FALSE OR t.is_deleted IS NULL)
       ${deptFilter}
       GROUP BY v.vehicle_id, v.plate_number, v.vehicle_type, v.department_id, d.name, v.current_km
       ORDER BY v.plate_number ASC
@@ -1517,7 +1517,7 @@ app.get('/api/reports/vehicle-history', authenticateToken, async (req, res) => {
       LEFT JOIN users u ON t.user_id = u.user_id
       LEFT JOIN departments d ON t.department_id = d.department_id
       LEFT JOIN maintenance_categories mc ON LOWER(mc.name) = LOWER(t.category)
-      WHERE (t.wheel_id = $1 OR $1 = ANY(t.vehicle_numbers)) AND (t.is_deleted = FALSE OR t.is_deleted IS NULL)
+      WHERE (t.wheel_id = $1 OR t.vehicle_numbers::text LIKE '%' || $1 || '%') AND (t.is_deleted = FALSE OR t.is_deleted IS NULL)
       ORDER BY t.created_at DESC
     `;
     const txRes = await pool.query(query, [wheel_id.trim()]);
@@ -1883,7 +1883,7 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
     // 2. جلب كافة معاملات الصيانة المرتبطة بالعجلة
     const txRes = await client.query(
       `SELECT * FROM transactions 
-       WHERE (wheel_id = $1 OR $1 = ANY(vehicle_numbers) OR wheel_id = $2) 
+       WHERE (wheel_id = $1 OR vehicle_numbers::text LIKE '%' || $1 || '%' OR wheel_id = $2) 
          AND (is_deleted = FALSE OR is_deleted IS NULL)`,
       [plateNumber, vehicle.vehicle_id]
     );
@@ -1920,7 +1920,7 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
       await client.query(
         `UPDATE transactions 
          SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = $1 
-         WHERE (wheel_id = $2 OR $2 = ANY(vehicle_numbers) OR wheel_id = $3)`,
+         WHERE (wheel_id = $2 OR vehicle_numbers::text LIKE '%' || $2 || '%' OR wheel_id = $3)`,
         [actor.id || actor.user_id, plateNumber, vehicle.vehicle_id]
       );
     }
