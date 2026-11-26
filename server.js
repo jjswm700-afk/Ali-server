@@ -217,7 +217,7 @@ async function calculateDueKm(wheelId, category, currentMileage) {
   let baseKm = parseInt(currentMileage, 10) || 0;
   try {
     const prevTx = await pool.query(
-      `SELECT COALESCE(mileage, current_km, 0) as km 
+      `SELECT COALESCE(mileage, 0) as km 
        FROM transactions 
        WHERE (wheel_id = $1 OR vehicle_numbers::text LIKE '%' || $1 || '%') 
          AND LOWER(category) = LOWER($2) 
@@ -235,7 +235,7 @@ async function calculateDueKm(wheelId, category, currentMileage) {
 }
 
 // دالة الفحص التلقائي والتنبيه الفوري عند استحقاق الصيانة (Overdue Maintenance Smart Auto-Alert - Axis 5)
-async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUserId, departmentId) {
+async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUserId, departmentId, excludeTxId = null) {
   try {
     const curKm = parseInt(currentMileage, 10);
     if (isNaN(curKm) || curKm <= 0) return;
@@ -260,30 +260,34 @@ async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUs
     }
 
     // العثور على مسؤولي القسم لهذا القسم (DEPARTMENT_HEAD)
-    const deptHeadRes = await pool.query(
-      `SELECT user_id FROM users 
-       WHERE (department_id = $1 OR assigned_department_id = $1)
-         AND (UPPER(role) = 'DEPARTMENT_HEAD' OR is_department_manager = TRUE)
-         AND is_active = TRUE AND (is_deleted = FALSE OR is_deleted IS NULL)`,
-      [departmentId]
-    );
-    const deptHeadIds = deptHeadRes.rows.map(r => r.user_id);
+    let deptHeadIds = [];
+    try {
+      const deptHeadRes = await pool.query(
+        `SELECT user_id FROM users 
+         WHERE (department_id = $1 OR assigned_department_id = $1)
+           AND (UPPER(role) = 'DEPARTMENT_HEAD' OR is_department_manager = TRUE)
+           AND is_active = TRUE AND (is_deleted = FALSE OR is_deleted IS NULL)`,
+        [departmentId]
+      );
+      deptHeadIds = deptHeadRes.rows.map(r => r.user_id);
+    } catch (e) {}
 
     for (const cat of catRows) {
       const categoryName = cat.name;
       const defaultReplacementKm = parseInt(cat.default_replacement_km, 10);
       if (!defaultReplacementKm || defaultReplacementKm <= 0) continue;
 
-      // حساب Last Service KM لنفس نوع الصيانة
+      // حساب Last Service KM لنفس نوع الصيانة مع استبعاد المعاملة الحالية
       const prevTx = await pool.query(
-        `SELECT COALESCE(mileage, current_km, 0) as km 
+        `SELECT COALESCE(mileage, 0) as km 
          FROM transactions 
          WHERE (wheel_id = $1 OR vehicle_numbers::text LIKE '%' || $1 || '%') 
            AND LOWER(category) = LOWER($2) 
+           AND ($3::text IS NULL OR transaction_id != $3)
            AND (is_deleted = FALSE OR is_deleted IS NULL)
          ORDER BY mileage DESC, created_at DESC 
          LIMIT 1`,
-        [wheelId, categoryName]
+        [wheelId, categoryName, excludeTxId]
       );
 
       let lastServiceKm = 0;
@@ -304,7 +308,7 @@ async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUs
         if (submitterUserId) {
           await sendNotification(
             submitterUserId,
-            null,
+            excludeTxId,
             alertTitle,
             alertPurpose,
             alertMessage,
@@ -321,7 +325,7 @@ async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUs
           if (headId !== submitterUserId) {
             await sendNotification(
               headId,
-              null,
+              excludeTxId,
               alertTitle,
               alertPurpose,
               alertMessage,
@@ -355,7 +359,7 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
   res.json({
     status: 'online',
     system: 'Wheel Maintenance Cloud API',
-    version: '6.1.0 (Fleet Integrity, Cascade Transfers & Smart Alerts)',
+    version: '6.1.1 (Fleet Integrity, Cascade Transfers & Smart Alerts Fix)',
     database: dbStatus,
     timestamp: new Date().toISOString()
   });
@@ -616,7 +620,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     });
 
     // إطلاق الفحص التلقائي والتنبيه الفوري عند استحقاق الصيانة (Smart Overdue Alert - Axis 5)
-    await checkAndTriggerOverdueAlerts(existingVeh.plate_number || primaryWheel, mileage, targetUserId, userDept);
+    await checkAndTriggerOverdueAlerts(existingVeh.plate_number || primaryWheel, mileage, targetUserId, userDept, txId);
 
     res.status(201).json({
       success: true,
