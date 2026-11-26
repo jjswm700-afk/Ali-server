@@ -101,6 +101,13 @@ async function ensureTables() {
   } catch (e) { console.warn('Categories Init:', e.message); }
 
   try {
+    // التأكد من تفعيل الأقسام الأساسية
+    await pool.query(`
+      UPDATE departments SET is_deleted = FALSE WHERE department_id IN ('DEPT-001', 'DEPT-002', 'DEPT-000');
+    `);
+  } catch (e) {}
+
+  try {
     // إزالة قيود التحقق القديمة عن عمود role لتمكين دور MANAGEMENT
     await pool.query(`
       DO $$
@@ -359,7 +366,7 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
   res.json({
     status: 'online',
     system: 'Wheel Maintenance Cloud API',
-    version: '6.1.1 (Fleet Integrity, Cascade Transfers & Smart Alerts Fix)',
+    version: '6.1.2 (Fleet Integrity, Cascade Transfers & Smart Alerts Full)',
     database: dbStatus,
     timestamp: new Date().toISOString()
   });
@@ -1317,13 +1324,13 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
       updates.push(`updated_at = NOW()`);
       values.push(currentVeh.vehicle_id);
 
-      const q = `UPDATE vehicles SET ${updates.join(', ')} WHERE vehicle_id = $${idx} RETURNING *`;
+      const q = `UPDATE vehicles SET ${updates.join(', ')} WHERE vehicle_id = $${values.length} OR plate_number = $${values.length} RETURNING *`;
       await client.query(q, values);
     }
 
     let cascadedTransactionsCount = 0;
 
-    // 2. إذا تم تغيير القسم، ترحيل كافة معاملات الصيانة وطلبات الصيانة إلى القسم الجديد تلقائياً
+    // 2. إذا تم تغيير القسم، ترحيل كافة معاملات الصيانة التابعة للعجلة إلى القسم الجديد تلقائياً
     if (newDept && newDept !== oldDept) {
       const txTransferRes = await client.query(
         `UPDATE transactions 
@@ -1332,18 +1339,9 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
         [newDept, oldPlate, currentVeh.vehicle_id]
       );
       cascadedTransactionsCount = txTransferRes.rowCount || 0;
-
-      try {
-        await client.query(
-          `UPDATE maintenance_requests 
-           SET department_id = $1 
-           WHERE (vehicle_number = $2 OR plate_number = $2 OR vehicle_id = $3)`,
-          [newDept, oldPlate, currentVeh.vehicle_id]
-        );
-      } catch (e) {}
     }
 
-    // 3. إذا تم تعديل رقم لوحة العجلة، تحديثه في كافة سجلات transactions وطلبات الصيانة
+    // 3. إذا تم تعديل رقم لوحة العجلة، تحديثه في كافة سجلات transactions
     if (newPlate && newPlate !== oldPlate) {
       await client.query(
         `UPDATE transactions 
@@ -1357,15 +1355,6 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
          WHERE (wheel_id = $2 OR vehicle_numbers::text LIKE '%' || $2 || '%' OR wheel_id = $3)`,
         [newPlate, oldPlate, currentVeh.vehicle_id]
       );
-
-      try {
-        await client.query(
-          `UPDATE maintenance_requests 
-           SET vehicle_number = $1 
-           WHERE (vehicle_number = $2 OR plate_number = $2 OR vehicle_id = $3)`,
-          [newPlate, oldPlate, currentVeh.vehicle_id]
-        );
-      } catch (e) {}
     }
 
     await client.query('COMMIT');
@@ -1896,7 +1885,7 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
     // 3. أخذ نسخة احتياطية شاملة في deleted_records
     await client.query(
       `INSERT INTO deleted_records (entity_type, entity_id, record_snapshot, deleted_by, deleted_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
       ['vehicle', String(vehicle.vehicle_id), JSON.stringify({
         vehicle: vehicle,
         transactions_count: relatedTransactions.length,
@@ -1908,14 +1897,14 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
     for (const tx of relatedTransactions) {
       await client.query(
         `INSERT INTO deleted_records (entity_type, entity_id, record_snapshot, deleted_by, deleted_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
+         VALUES ($1, $2, $3::jsonb, $4, NOW())`,
         ['transaction', String(tx.transaction_id || tx.id), JSON.stringify(tx), actor.full_name || actor.username]
       );
     }
 
     // 4. حذف العجلة (Soft-delete)
     await client.query(
-      `UPDATE vehicles SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = $1 WHERE vehicle_id = $2`,
+      `UPDATE vehicles SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = $1 WHERE vehicle_id = $2 OR plate_number = $2`,
       [actor.id || actor.user_id, vehicle.vehicle_id]
     );
 
@@ -1928,16 +1917,6 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
         [actor.id || actor.user_id, plateNumber, vehicle.vehicle_id]
       );
     }
-
-    // 6. حذف أي طلبات صيانة مرتبطة إن وجدت
-    try {
-      await client.query(
-        `UPDATE maintenance_requests 
-         SET is_deleted = TRUE, deleted_at = NOW() 
-         WHERE (vehicle_number = $1 OR plate_number = $1 OR vehicle_id = $2)`,
-        [plateNumber, vehicle.vehicle_id]
-      );
-    } catch (e) {}
 
     await client.query('COMMIT');
 
