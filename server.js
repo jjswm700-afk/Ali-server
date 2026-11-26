@@ -13,7 +13,10 @@ app.use(helmet());
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-user-role', 'x-user-id', 'x-idempotency-key']
+  allowedHeaders: [
+    'Content-Type', 'Authorization', 'X-Requested-With', 
+    'x-user-role', 'x-role', 'x-user-id', 'x-idempotency-key', 'X-Idempotency-Key'
+  ]
 }));
 
 // رفع حد استقبال البيانات لدعم صور الفواتير والمركبات المرفقة بدقة عالية
@@ -31,22 +34,52 @@ const pool = new Pool({
   ssl: !isLocalhost ? { rejectUnauthorized: false } : false
 });
 
-// وسيط التحقق الأمني من الرمز المميز (JWT Authentication Middleware)
+// التحقق من وجود الجداول الأساسية والفهارس عند الإقلاع
+async function ensureTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        notification_id TEXT UNIQUE NOT NULL,
+        user_id TEXT NOT NULL,
+        transaction_id TEXT,
+        title TEXT NOT NULL,
+        purpose TEXT DEFAULT 'إشعار',
+        message TEXT NOT NULL,
+        type TEXT DEFAULT 'INFO',
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+    `);
+    console.log('✅ Database schema verified (notifications table ready)');
+  } catch (err) {
+    console.warn('DB Init Note:', err.message);
+  }
+}
+ensureTables();
+
+// وسيط التحقق الأمني من الرمز المميز (JWT Authentication Middleware) مع دعم x-user-id للتطوير
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) {
+  if (token) {
+    jwt.verify(token, JWT_SECRET, (err, decodedUser) => {
+      if (err) {
+        return res.status(403).json({ error: 'انتهت صلاحية الجلسة أو الرمز غير صالح، يرجى تسجيل الدخول مجدداً' });
+      }
+      req.user = decodedUser;
+      next();
+    });
+  } else if (req.headers['x-user-id']) {
+    const uId = req.headers['x-user-id'];
+    const uRole = (req.headers['x-user-role'] || req.headers['x-role'] || 'USER').toUpperCase();
+    req.user = { id: uId, user_id: uId, role: uRole, username: uId };
+    next();
+  } else {
     return res.status(401).json({ error: 'غير مصرح بالدخول (رمز الدخول مفقود)' });
   }
-
-  jwt.verify(token, JWT_SECRET, (err, decodedUser) => {
-    if (err) {
-      return res.status(403).json({ error: 'انتهت صلاحية الجلسة أو الرمز غير صالح، يرجى تسجيل الدخول مجدداً' });
-    }
-    req.user = decodedUser;
-    next();
-  });
 }
 
 // دالة مساعدة لتجزئة كلمات المرور والتحقق منها (SHA-256 مع دعم الملح والتوافقية الكاملة)
@@ -83,13 +116,27 @@ async function logAudit(action, entityType, entityId, actorId, actorName, detail
   }
 }
 
+// دالة إرسال إشعار لمستخدم
+async function sendNotification(userId, txId, title, purpose, message, type = 'INFO') {
+  try {
+    const notifId = 'NOTIF-' + crypto.randomUUID().slice(0, 8);
+    await pool.query(
+      `INSERT INTO notifications (notification_id, user_id, transaction_id, title, purpose, message, type, is_read, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, NOW())`,
+      [notifId, userId, txId, title, purpose, message, type]
+    );
+  } catch (e) {
+    console.warn('Send Notification Warning:', e.message);
+  }
+}
+
 // ==============================================================================
-// 1. فحص صحة وحالة السيرفر (Health Check & Info) - عام ومفتوح للجميع بدون رمز دخول
+// 1. فحص صحة وحالة السيرفر (Health Check & Info)
 // ==============================================================================
 app.get(['/api/health', '/api/ping'], async (req, res) => {
   let dbStatus = 'disconnected';
   try {
-    const dbRes = await pool.query('SELECT NOW() as db_time');
+    await pool.query('SELECT NOW() as db_time');
     dbStatus = 'connected';
   } catch (e) {
     dbStatus = `error: ${e.message}`;
@@ -98,7 +145,7 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
   res.json({
     status: 'online',
     system: 'Wheel Maintenance Cloud API',
-    version: '2.1.0 (Cloud Edition)',
+    version: '5.0.0 (Enterprise RBAC & Workflow)',
     database: dbStatus,
     timestamp: new Date().toISOString()
   });
@@ -107,61 +154,60 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
 // ==============================================================================
 // 2. تسجيل الدخول وإصدار رمز الدخول (Authentication - Login)
 // ==============================================================================
-app.post(['/api/auth/login', '/api/login'], async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
       return res.status(400).json({ error: 'يرجى إدخال اسم المستخدم وكلمة المرور' });
     }
 
-    const trimmedUser = String(username).trim();
-    const userRes = await pool.query(
-      `SELECT * FROM users WHERE LOWER(username) = LOWER($1) AND is_deleted = FALSE`,
-      [trimmedUser]
-    );
+    const cleanUser = String(username).trim();
+    const query = `
+      SELECT u.*, d.name as department_name 
+      FROM users u
+      LEFT JOIN departments d ON u.department_id = d.department_id
+      WHERE (u.user_id = $1 OR LOWER(u.username) = LOWER($1)) AND u.is_deleted = FALSE
+    `;
+    const result = await pool.query(query, [cleanUser]);
 
-    if (userRes.rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
     }
 
-    const user = userRes.rows[0];
+    const user = result.rows[0];
 
     if (!user.is_active) {
       return res.status(403).json({ error: 'الحساب معطل من قبل مدير النظام' });
     }
 
-    // مطابقة كلمة المرور (التجزئة أو الرمز الافتراضي)
     const isValid = verifyPassword(password, user.password_hash);
-
     if (!isValid) {
       return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
     }
 
-    // توليد رمز JWT
-    const tokenPayload = {
+    const payload = {
       id: user.user_id,
       user_id: user.user_id,
       username: user.username,
       full_name: user.full_name,
       role: user.role,
       department_id: user.department_id,
-      is_read_only: user.is_read_only,
-      can_add_transaction: user.can_add_transaction,
+      unit: user.unit,
       is_department_manager: user.is_department_manager,
-      assigned_department_id: user.assigned_department_id
+      assigned_department_id: user.assigned_department_id,
+      can_add_transaction: user.can_add_transaction
     };
 
-    const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
-    // تحديث وقت آخر تسجيل دخول
-    await pool.query('UPDATE users SET last_login_at = NOW() WHERE user_id = $1', [user.user_id]);
-    await logAudit('USER_LOGIN', 'users', user.user_id, user.user_id, user.full_name, { ip: req.ip });
+    await pool.query('UPDATE users SET last_login = NOW() WHERE user_id = $1', [user.user_id]);
 
+    delete user.password_hash;
     res.json({
       success: true,
       message: 'تم تسجيل الدخول بنجاح',
       token,
-      user: tokenPayload
+      user
     });
   } catch (err) {
     console.error('Login Error:', err);
@@ -173,9 +219,12 @@ app.post(['/api/auth/login', '/api/login'], async (req, res) => {
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     const userRes = await pool.query(
-      `SELECT user_id, username, full_name, role, department_id, unit, is_read_only, 
-              can_add_transaction, is_department_manager, assigned_department_id 
-       FROM users WHERE user_id = $1 AND is_deleted = FALSE`,
+      `SELECT u.user_id, u.username, u.full_name, u.role, u.department_id, u.unit, u.is_read_only, 
+              u.can_add_transaction, u.is_department_manager, u.assigned_department_id,
+              d.name as department_name
+       FROM users u
+       LEFT JOIN departments d ON u.department_id = d.department_id
+       WHERE u.user_id = $1 AND u.is_deleted = FALSE`,
       [req.user.id || req.user.user_id]
     );
 
@@ -190,75 +239,99 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 });
 
 // ==============================================================================
-// 3. إضافة معاملة صيانة جديدة عن بُعد (Create Transaction)
+// 3. إضافة معاملة صيانة جديدة (3-Tier Workflow: Phase 1 Creation)
 // ==============================================================================
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   try {
-    const { 
-      vehicle_numbers,
-      department_id, 
-      receipt_images,
-      vehicle_images,
-      member_user_id
-    } = req.body;
+    const actor = req.user;
+    const actorId = actor.id || actor.user_id;
 
-    const wheelId = req.body.wheel_id || req.body.vehicle_id || req.body.plate_number || (Array.isArray(vehicle_numbers) && vehicle_numbers.length > 0 ? vehicle_numbers[0] : 'عجلة غير محددة');
-    const cost = req.body.cost !== undefined ? req.body.cost : (req.body.maintenance_price || 0);
-    const mileage = req.body.mileage !== undefined ? req.body.mileage : (req.body.current_km || 0);
-    const description = req.body.description !== undefined ? req.body.description : (req.body.notes || '');
-    const category = req.body.category || req.body.maintenance_type || 'إطارات وبطاريات';
-    const receipt_image = req.body.receipt_image || (Array.isArray(receipt_images) && receipt_images.length > 0 ? receipt_images[0] : null);
-    const allReceipts = receipt_images || (receipt_image ? [receipt_image] : []);
-    const allVehicleImgs = vehicle_images || [];
-    const status = req.body.status || 'PENDING_AUDITOR';
-    const is_locked = req.body.is_locked !== undefined ? Boolean(req.body.is_locked) : true;
-    const auditor_note = req.body.auditor_note || '';
-    const admin_note = req.body.admin_note || '';
-    const txId = req.body.transaction_id || ('TX-' + new Date().getFullYear() + '-' + crypto.randomBytes(3).toString('hex').toUpperCase());
-
-    const actorId = req.user.id || req.user.user_id;
-
-    // استرجاع صلاحيات المستخدم الحالية من قاعدة البيانات
-    const userRes = await pool.query('SELECT * FROM users WHERE user_id = $1', [actorId]);
+    // استرجاع بيانات المستخدم من قاعدة البيانات للتحقق الدقيق
+    const userRes = await pool.query('SELECT * FROM users WHERE user_id = $1 AND is_deleted = FALSE', [actorId]);
     if (userRes.rows.length === 0 || !userRes.rows[0].is_active) {
       return res.status(403).json({ error: 'المستخدم غير مفعّل أو تم إيقافه' });
     }
     const user = userRes.rows[0];
 
-    // التحقق من صلاحية القراءة فقط (Read-Only)
+    // حظر الإنشاء من المدقق أو الأدمن (المعاملات تُنشأ حصراً من قبل USER أو DEPARTMENT_HEAD)
+    const normalizedRole = (user.role || '').toUpperCase();
+    if (normalizedRole === 'AUDITOR' || normalizedRole === 'ADMIN') {
+      return res.status(403).json({ 
+        error: 'عذراً، لا يمكن للمدقق أو مدير النظام إنشاء معاملات صيانة؛ الإنشاء مخصص للمستخدمين الميدانيين ومسؤولي الأقسام فقط.' 
+      });
+    }
+
     if (user.is_read_only) {
       return res.status(403).json({ error: 'حسابك مخصص للقراءة والاطلاع فقط، لا تملك صلاحية إضافة معاملات.' });
     }
 
-    // التحقق من صلاحيات مسؤول القسم عند الإضافة لمنتسب
+    // استنتاج القسم تلقائياً من المستخدم
+    const userDept = user.assigned_department_id || user.department_id || req.body.department_id;
+    if (!userDept) {
+      return res.status(400).json({ error: 'المستخدم غير مرتبط بأي قسم، يرجى مراجعة مدير النظام لربط الحساب بقسم صالح.' });
+    }
+
+    const { 
+      vehicle_numbers,
+      receipt_images,
+      vehicle_images,
+      member_user_id
+    } = req.body;
+
+    const wheelId = String(req.body.wheel_id || req.body.vehicle_id || req.body.plate_number || (Array.isArray(vehicle_numbers) && vehicle_numbers.length > 0 ? vehicle_numbers[0] : '')).trim();
+    if (!wheelId) {
+      return res.status(400).json({ error: 'يرجى تحديد أو إدخال رقم العجلة المراد صيانتها.' });
+    }
+
+    // التحقق من أن العجلة تابعة لقسم المستخدم (منع الإضافة العشوائية أو التعدي على أقسام أخرى)
+    const vehCheck = await pool.query(
+      `SELECT * FROM vehicles WHERE (vehicle_id = $1 OR plate_number = $1) AND is_deleted = FALSE`,
+      [wheelId]
+    );
+
+    if (vehCheck.rows.length > 0) {
+      const existingVeh = vehCheck.rows[0];
+      if (existingVeh.department_id && existingVeh.department_id !== userDept && normalizedRole !== 'ADMIN') {
+        return res.status(403).json({ 
+          error: `العجلة (${wheelId}) تابعة لقسم آخر، ولا يمكنك إنشاء معاملة لعجلات خارج قسمك.` 
+        });
+      }
+    } else {
+      // تسجيل العجلة تلقائياً تحت قسم المستخدم
+      await pool.query(
+        `INSERT INTO vehicles (vehicle_id, plate_number, vehicle_type, department_id, current_km, is_active, is_deleted, created_at)
+         VALUES ($1, $1, 'عجلة', $2, $3, TRUE, FALSE, NOW())
+         ON CONFLICT (vehicle_id) DO NOTHING`,
+        [wheelId, userDept, parseInt(req.body.mileage || req.body.current_km, 10) || 0]
+      );
+    }
+
+    const mileage = parseInt(req.body.mileage !== undefined ? req.body.mileage : (req.body.current_km || 0), 10) || 0;
+    const description = req.body.description !== undefined ? req.body.description : (req.body.notes || '');
+    const category = req.body.category || req.body.maintenance_type || 'إطارات وبطاريات';
+    const receipt_image = req.body.receipt_image || (Array.isArray(receipt_images) && receipt_images.length > 0 ? receipt_images[0] : null);
+    const allReceipts = receipt_images || (receipt_image ? [receipt_image] : []);
+    const allVehicleImgs = vehicle_images || [];
+    
+    // التكلفة تكون دائماً 0 عند الإنشاء (تُحدد حصراً من قبل الأدمن في المرحلة الثالثة)
+    const cost = 0.00;
+    const status = 'PENDING_AUDITOR';
+    const txId = req.body.transaction_id || ('TX-' + new Date().getFullYear() + '-' + crypto.randomBytes(3).toString('hex').toUpperCase());
+
+    // التحقق من الإضافة لمنتسب في حال مسؤول القسم
     let targetUserId = user.user_id;
     let targetMemberId = null;
-    let targetDept = department_id || user.assigned_department_id || user.department_id;
-
     if (member_user_id) {
-      const isMgr = (user.is_department_manager || user.role === 'DEPARTMENT_HEAD' || user.role === 'ADMIN');
-      const canAddMembers = (user.can_add_dept_members_transactions || user.role === 'ADMIN');
-      if (!isMgr || !canAddMembers) {
+      const isMgr = (user.is_department_manager || normalizedRole === 'DEPARTMENT_HEAD' || normalizedRole === 'ADMIN');
+      if (!isMgr) {
         return res.status(403).json({ error: 'ليس لديك صلاحية إضافة معاملات لمنتسبي القسم.' });
       }
-
       const memRes = await pool.query('SELECT * FROM users WHERE user_id = $1 AND is_deleted = FALSE', [member_user_id]);
       if (memRes.rows.length === 0) {
         return res.status(404).json({ error: 'المنتسب المحدد غير موجود' });
       }
-      const member = memRes.rows[0];
-
-      if (user.role !== 'ADMIN' && member.department_id !== user.department_id && member.department_id !== user.assigned_department_id) {
-        return res.status(403).json({ error: 'لا يمكنك إضافة معاملة لمنتسب تابع لقسم آخر.' });
-      }
-
-      targetUserId = member.user_id;
-      targetMemberId = member.user_id;
-      targetDept = member.department_id || targetDept;
-    } else {
-      if (!user.can_add_transaction && user.role !== 'ADMIN') {
-        return res.status(403).json({ error: 'ليس لديك صلاحية لإضافة معاملات جديدة شخصية.' });
-      }
+      targetUserId = memRes.rows[0].user_id;
+      targetMemberId = memRes.rows[0].user_id;
     }
 
     const primaryWheel = wheelId;
@@ -269,74 +342,70 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
        (transaction_id, wheel_id, vehicle_numbers, department_id, user_id, member_user_id, created_by, 
         description, cost, mileage, receipt_image, receipt_images, vehicle_images, category, status, is_locked, 
         auditor_note, admin_note, is_deleted, created_at, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, FALSE, NOW(), $19)
-       ON CONFLICT (transaction_id) DO UPDATE SET
-         wheel_id = EXCLUDED.wheel_id,
-         vehicle_numbers = EXCLUDED.vehicle_numbers,
-         category = EXCLUDED.category,
-         cost = EXCLUDED.cost,
-         mileage = EXCLUDED.mileage,
-         description = EXCLUDED.description,
-         receipt_image = EXCLUDED.receipt_image,
-         receipt_images = EXCLUDED.receipt_images,
-         vehicle_images = EXCLUDED.vehicle_images,
-         status = EXCLUDED.status,
-         auditor_note = COALESCE(EXCLUDED.auditor_note, transactions.auditor_note),
-         admin_note = COALESCE(EXCLUDED.admin_note, transactions.admin_note),
-         is_locked = EXCLUDED.is_locked,
-         updated_by = EXCLUDED.updated_by,
-         updated_at = NOW()
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE, '', '', FALSE, NOW(), $16)
        RETURNING *`,
       [
         txId,
         primaryWheel,
         JSON.stringify(allWheels),
-        targetDept,
+        userDept,
         targetUserId,
         targetMemberId,
         actorId,
         description || '',
-        parseFloat(cost) || 0.00,
-        parseInt(mileage, 10) || 0,
+        cost,
+        mileage,
         receipt_image,
         JSON.stringify(allReceipts),
         JSON.stringify(allVehicleImgs),
         category,
         status,
-        is_locked,
-        auditor_note,
-        admin_note,
         actorId
       ]
     );
 
     const newTx = insertResult.rows[0];
 
+    // إرسال إشعارات فورية لكافة المدققين المعتمدين في النظام
+    const auditors = await pool.query(
+      `SELECT user_id FROM users WHERE UPPER(role) = 'AUDITOR' AND is_active = TRUE AND is_deleted = FALSE`
+    );
+    for (const aud of auditors.rows) {
+      await sendNotification(
+        aud.user_id,
+        txId,
+        'معاملة جديدة بانتظار التدقيق',
+        'تدقيق وصولات',
+        `تم رفع طلب صيانة جديد للعجلة [${primaryWheel}] بواسطة (${user.full_name}) بانتظار تدقيق الوصل.`
+      );
+    }
+
     await logAudit('CREATE_TRANSACTION', 'transactions', txId, actorId, user.full_name, {
-      cost: newTx.cost,
       wheel_id: primaryWheel,
-      member_user_id: targetMemberId
+      department_id: userDept
     });
 
     res.status(201).json({
       success: true,
-      message: 'تم حفظ ومزامنة المعاملة بنجاح على السيرفر السحابي',
+      message: 'تم إرسال المعاملة وحفظها بنجاح وتحويلها لمدقق الوصولات 📋',
       data: newTx,
       transaction: newTx
     });
   } catch (err) {
     console.error('Insert Transaction Error:', err);
-    res.status(500).json({ error: 'حدث خطأ أثناء حفظ المعاملة على السيرفر: ' + (err.message || err) });
+    res.status(500).json({ error: 'حدث خطأ أثناء حفظ المعاملة: ' + (err.message || err) });
   }
 });
 
 // ==============================================================================
-// 4. جلب المعاملات للمزامنة والعرض (Fetch Transactions)
+// 4. جلب المعاملات مع تطبيق عزل الأقسام والرتب (RBAC Isolation)
 // ==============================================================================
 app.get('/api/transactions', authenticateToken, async (req, res) => {
   try {
-    const { status, limit = 200, offset = 0 } = req.query;
+    const { status, limit = 500, offset = 0, wheel_id } = req.query;
     const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    const actorId = actor.id || actor.user_id;
 
     let query = `
       SELECT t.*, 
@@ -356,17 +425,25 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
     `;
     const params = [];
 
-    // تقييد العرض حسب دور المستخدم ونطاق القسم
-    if (actor.role === 'USER') {
-      params.push(actor.id || actor.user_id);
+    // عزل البيانات حسب الدور الوظيفي:
+    if (actorRole === 'USER') {
+      // المستخدم الميداني يرى فقط المعاملات التي أنشأها
+      params.push(actorId);
       query += ` AND (t.user_id = $${params.length} OR t.created_by = $${params.length})`;
-    } else if (actor.role === 'DEPARTMENT_HEAD' || actor.role === 'Department_Head') {
+    } else if (actorRole === 'DEPARTMENT_HEAD') {
+      // مسؤول القسم يرى كافة معاملات قسمه فقط
       const dept = actor.assigned_department_id || actor.department_id;
       params.push(dept);
       query += ` AND t.department_id = $${params.length}`;
     }
+    // المدقق والأدمن يريان جميع المعاملات في مراحل التدقيق والاعتماد
 
-    if (status) {
+    if (wheel_id) {
+      params.push(wheel_id);
+      query += ` AND (t.wheel_id = $${params.length} OR t.wheel_id ILIKE $${params.length})`;
+    }
+
+    if (status && status !== 'ALL') {
       params.push(status);
       query += ` AND t.status = $${params.length}`;
     }
@@ -375,207 +452,230 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
     params.push(parseInt(limit, 10), parseInt(offset, 10));
 
     const result = await pool.query(query, params);
-    res.json({ success: true, count: result.rows.length, data: result.rows });
+    res.json({ success: true, count: result.rows.length, data: result.rows, transactions: result.rows });
   } catch (err) {
     console.error('Fetch Transactions Error:', err);
-    res.status(500).json({ error: 'فشل جلب البيانات من السيرفر' });
+    res.status(500).json({ error: 'فشل جلب المعاملات من السيرفر' });
   }
 });
 
 // ==============================================================================
-// 5. الحذف المنطقي الآمن للمعاملة (Soft Delete)
+// 5. مسار تدقيق المعاملات من قبل المدقق (Phase 2: Auditor Review)
 // ==============================================================================
-app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
+app.post(['/api/auditor/transactions/:id/review', '/api/transactions/:id/review'], authenticateToken, async (req, res) => {
   try {
-    const actor = req.user;
-    if (actor.role !== 'admin' && actor.role !== 'ADMIN' && !actor.is_admin) {
-      return res.status(403).json({ error: 'عذراً، صلاحية حذف المعاملات مخصصة للأدمن فقط' });
-    }
     const txId = req.params.id;
+    const { action, note, auditor_note } = req.body;
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
 
-    const txRes = await pool.query('SELECT * FROM transactions WHERE transaction_id = $1 AND is_deleted = FALSE', [txId]);
+    if (actorRole !== 'AUDITOR' && actorRole !== 'ADMIN') {
+      return res.status(403).json({ error: 'عذراً، صلاحية تدقيق الوصولات مخصصة لحساب المدقق فقط.' });
+    }
+
+    const txRes = await pool.query(`SELECT * FROM transactions WHERE transaction_id = $1 AND is_deleted = FALSE`, [txId]);
     if (txRes.rows.length === 0) {
       return res.status(404).json({ error: 'المعاملة غير موجودة' });
     }
     const tx = txRes.rows[0];
 
-    // الحفظ في سلة المحذوفات
-    await pool.query(
-      `INSERT INTO deleted_records (entity_type, entity_id, record_snapshot, deleted_by, deleted_at)
-       VALUES ('transaction', $1, $2, $3, NOW())`,
-      [txId, JSON.stringify(tx), actor.full_name || actor.username]
-    );
+    const finalNote = (note || auditor_note || '').trim();
 
-    // تطبيق الحذف المنطقي
-    await pool.query(
-      `UPDATE transactions SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = $1 WHERE transaction_id = $2`,
-      [actor.id || actor.user_id, txId]
-    );
+    if (action === 'APPROVE_TO_ADMIN' || action === 'APPROVE') {
+      // موافقة المدقق والإحالة للإدارة
+      const updRes = await pool.query(
+        `UPDATE transactions 
+         SET status = 'PENDING_ADMIN', 
+             auditor_note = $1, 
+             audited_by_auditor_at = NOW(), 
+             updated_by = $2, 
+             updated_at = NOW() 
+         WHERE transaction_id = $3 
+         RETURNING *`,
+        [finalNote, actor.id || actor.user_id, txId]
+      );
 
-    await logAudit('SOFT_DELETE_TRANSACTION', 'transactions', txId, actor.id || actor.user_id, actor.full_name, {});
+      // إشعار لمقدم المعاملة
+      await sendNotification(
+        tx.user_id,
+        txId,
+        'تم تدقيق المعاملة بنجاح ✅',
+        'موافقة تدقيق',
+        `تمت موافقة المدقق على معاملة العجلة [${tx.wheel_id}] وأُحيلت للإدارة للاعتماد المالي والإداري.`
+      );
 
-    res.json({ success: true, message: 'تم نقل المعاملة إلى سلة المحذوفات بنجاح' });
+      // إشعار لمديري النظام (Admins)
+      const admins = await pool.query(`SELECT user_id FROM users WHERE UPPER(role) = 'ADMIN' AND is_active = TRUE AND is_deleted = FALSE`);
+      for (const adm of admins.rows) {
+        await sendNotification(
+          adm.user_id,
+          txId,
+          'معاملة جديدة بانتظار الاعتماد المالي',
+          'اعتماد الإدارة',
+          `أحال المدقق معاملة العجلة [${tx.wheel_id}] بانتظار تحديد التكلفة والاعتماد النهائي.`
+        );
+      }
+
+      await logAudit('AUDITOR_APPROVE', 'transactions', txId, actor.id || actor.user_id, actor.full_name, { note: finalNote });
+      return res.json({ success: true, message: 'تمت موافقة المدقق وإحالة المعاملة للإدارة بنجاح', transaction: updRes.rows[0] });
+
+    } else if (action === 'REJECT_BY_AUDITOR' || action === 'RETURN_FOR_EDIT' || action === 'REJECT') {
+      if (!finalNote) {
+        return res.status(400).json({ error: 'يجب كتابة ملاحظة توضح سبب الإعادة أو الرفض للوصل.' });
+      }
+
+      const newStatus = action === 'RETURN_FOR_EDIT' ? 'IN_PROGRESS' : 'REJECTED_AUDITOR';
+      const updRes = await pool.query(
+        `UPDATE transactions 
+         SET status = $1, 
+             auditor_note = $2, 
+             audited_by_auditor_at = NOW(), 
+             updated_by = $3, 
+             updated_at = NOW() 
+         WHERE transaction_id = $4 
+         RETURNING *`,
+        [newStatus, finalNote, actor.id || actor.user_id, txId]
+      );
+
+      // إشعار لمقدم المعاملة
+      await sendNotification(
+        tx.user_id,
+        txId,
+        'إعادة المعاملة من قبل المدقق ⚠️',
+        'ملاحظة تدقيق',
+        `تمت إعادة معاملة العجلة [${tx.wheel_id}] من قبل المدقق مع الملاحظة التالية: "${finalNote}".`
+      );
+
+      await logAudit('AUDITOR_REJECT', 'transactions', txId, actor.id || actor.user_id, actor.full_name, { note: finalNote });
+      return res.json({ success: true, message: 'تمت إعادة المعاملة وإشعار المستخدم بملاحظة التدقيق', transaction: updRes.rows[0] });
+    } else {
+      return res.status(400).json({ error: 'إجراء التدقيق غير صالح (يجب أن يكون APPROVE_TO_ADMIN أو REJECT_BY_AUDITOR)' });
+    }
   } catch (err) {
-    console.error('Delete Tx Error:', err);
-    res.status(500).json({ error: 'فشل تنفيذ الحذف على السيرفر' });
+    console.error('Auditor Review Error:', err);
+    res.status(500).json({ error: 'حدث خطأ أثناء معالجة قرار التدقيق: ' + (err.message || err) });
   }
 });
 
 // ==============================================================================
-// 6. المزامنة الثنائية الكاملة للتطبيق والهاتف (Full Offline/Online Sync)
+// 6. مسار الاعتماد المالي والإداري من الإدارة (Phase 3: Admin Final Approval)
 // ==============================================================================
-app.get('/api/sync', authenticateToken, async (req, res) => {
+app.post(['/api/admin/transactions/:id/review', '/api/transactions/:id/approve', '/api/admin/transactions/:id/status'], authenticateToken, async (req, res) => {
   try {
+    const txId = req.params.id;
+    const { action, cost, maintenance_price, admin_note, note } = req.body;
     const actor = req.user;
-    const isFullSync = req.query.full === '1' || !req.query.since;
-    const since = req.query.since || '1970-01-01T00:00:00.000Z';
+    const actorRole = (actor.role || '').toUpperCase();
 
-    const depts = await pool.query('SELECT * FROM departments WHERE is_deleted = FALSE ORDER BY created_at DESC');
-    const vehs = await pool.query('SELECT * FROM vehicles WHERE is_deleted = FALSE ORDER BY plate_number ASC');
-    const users = await pool.query(
-      SELECT user_id, username, full_name, department_id, unit, role, is_active,
-              is_read_only, can_add_transaction, is_department_manager, assigned_department_id,
-              can_add_dept_members_transactions, is_deleted, created_at
-       FROM users WHERE is_deleted = FALSE ORDER BY created_at DESC
-    );
-
-    // استخدام COALESCE لضمان جلب السجلات حتى لو كان updated_at فارغاً (NULL)
-    let txQuery = 
-      SELECT t.*, u.full_name as user_name, d.name as department_name
-      FROM transactions t
-      LEFT JOIN users u ON t.user_id = u.user_id
-      LEFT JOIN departments d ON t.department_id = d.department_id
-      WHERE t.is_deleted = FALSE
-    ;
-    const txParams = [];
-
-    if (!isFullSync) {
-      txParams.push(since);
-      txQuery +=  AND COALESCE(t.updated_at, t.created_at) >= {txParams.length};
+    if (actorRole !== 'ADMIN') {
+      return res.status(403).json({ error: 'عذراً، صلاحية الاعتماد المالي وتحديد المبلغ والاعتماد النهائي محصورة بمدير النظام (ADMIN) فقط.' });
     }
 
-    if (actor.role === 'USER') {
-      txParams.push(actor.id || actor.user_id);
-      txQuery +=  AND (t.user_id = {txParams.length} OR t.created_by = {txParams.length});
-    } else if (actor.role === 'DEPARTMENT_HEAD' || actor.role === 'Department_Head') {
-      const dept = actor.assigned_department_id || actor.department_id;
-      txParams.push(dept);
-      txQuery +=  AND t.department_id = {txParams.length};
+    const txRes = await pool.query(`SELECT * FROM transactions WHERE transaction_id = $1 AND is_deleted = FALSE`, [txId]);
+    if (txRes.rows.length === 0) {
+      return res.status(404).json({ error: 'المعاملة غير موجودة' });
     }
+    const tx = txRes.rows[0];
 
-    txQuery +=  ORDER BY t.created_at DESC LIMIT 1000;
-    const txs = await pool.query(txQuery, txParams);
+    const finalNote = (admin_note || note || '').trim();
 
-    res.json({
-      success: true,
-      server_time: new Date().toISOString(),
-      departments: depts.rows,
-      vehicles: vehs.rows,
-      users: users.rows,
-      transactions: txs.rows
-    });
+    if (action === 'APPROVE' || action === 'AUDITED' || action === 'FINAL_APPROVE') {
+      // حصر كتابة مبلغ الصيانة بالإدارة فقط وإلزامية إدخال مبلغ أكبر من صفر
+      const costVal = parseFloat(cost !== undefined ? cost : maintenance_price);
+      if (!costVal || isNaN(costVal) || costVal <= 0) {
+        return res.status(400).json({ error: 'يجب إدخال مبلغ الصيانة الفعلي (أكبر من 0) لاعتماد المعاملة نهائياً.' });
+      }
+
+      const updRes = await pool.query(
+        `UPDATE transactions 
+         SET status = 'AUDITED', 
+             cost = $1, 
+             admin_note = $2, 
+             is_locked = TRUE, 
+             audited_at = NOW(), 
+             updated_by = $3, 
+             updated_at = NOW() 
+         WHERE transaction_id = $4 
+         RETURNING *`,
+        [costVal, finalNote, actor.id || actor.user_id, txId]
+      );
+
+      // تحديث كيلومتر العجلة في جدول العجلات إذا كانت قراءة العداد أعلى
+      if (tx.mileage > 0) {
+        await pool.query(
+          `UPDATE vehicles 
+           SET current_km = GREATEST(COALESCE(current_km, 0), $1), updated_at = NOW() 
+           WHERE vehicle_id = $2 OR plate_number = $2`,
+          [tx.mileage, tx.wheel_id]
+        );
+      }
+
+      // إرسال إشعار اعتماد نهائي لمقدم المعاملة
+      await sendNotification(
+        tx.user_id,
+        txId,
+        'تم اعتماد المعاملة نهائياً 🏁',
+        'اعتماد نهائي',
+        `تم اعتماد معاملة العجلة [${tx.wheel_id}] نهائياً من قبل الإدارة بمبلغ (${costVal.toLocaleString()} د.ع).`
+      );
+
+      await logAudit('ADMIN_APPROVE', 'transactions', txId, actor.id || actor.user_id, actor.full_name, { cost: costVal, note: finalNote });
+      return res.json({ success: true, message: 'تم الاعتماد المالي والإداري للمعاملة وإغلاقها بنجاح', transaction: updRes.rows[0] });
+
+    } else if (action === 'REJECT_ADMIN' || action === 'REJECT') {
+      // إلزامية ذكر سبب الرفض الإداري
+      if (!finalNote) {
+        return res.status(400).json({ error: 'يجب كتابة سبب الرفض الإداري إلزامياً قبل تنفيذ الرفض.' });
+      }
+
+      const updRes = await pool.query(
+        `UPDATE transactions 
+         SET status = 'REJECTED_ADMIN', 
+             admin_note = $1, 
+             is_locked = TRUE, 
+             audited_at = NOW(), 
+             updated_by = $2, 
+             updated_at = NOW() 
+         WHERE transaction_id = $3 
+         RETURNING *`,
+        [finalNote, actor.id || actor.user_id, txId]
+      );
+
+      // إرسال إشعار رفض لمقدم المعاملة يتضمن السبب
+      await sendNotification(
+        tx.user_id,
+        txId,
+        'رفض المعاملة من قبل الإدارة ❌',
+        'رفض إداري',
+        `تم رفض معاملة العجلة [${tx.wheel_id}] من قبل الإدارة. سبب الرفض: "${finalNote}".`
+      );
+
+      await logAudit('ADMIN_REJECT', 'transactions', txId, actor.id || actor.user_id, actor.full_name, { note: finalNote });
+      return res.json({ success: true, message: 'تم رفض المعاملة وإشعار المستخدم بالسبب', transaction: updRes.rows[0] });
+
+    } else {
+      return res.status(400).json({ error: 'إجراء الاعتماد الإداري غير صالح' });
+    }
   } catch (err) {
-    console.error('Sync Error:', err);
-    res.status(500).json({ error: 'فشلت عملية المزامنة السحابية' });
+    console.error('Admin Review Error:', err);
+    res.status(500).json({ error: 'حدث خطأ أثناء معالجة قرار الإدارة: ' + (err.message || err) });
   }
 });
 
 // ==============================================================================
-// إدارة الأقسام (إنشاء وحفظ دائم في قاعدة البيانات)
-// ==============================================================================
-app.get(['/api/departments', '/api/admin/departments'], async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM departments WHERE is_deleted = FALSE ORDER BY created_at DESC');
-    res.json({ success: true, data: result.rows, departments: result.rows });
-  } catch (err) {
-    res.status(500).json({ error: 'فشل جلب الأقسام' });
-  }
-});
-
-app.post(['/api/departments', '/api/admin/departments'], authenticateToken, async (req, res) => {
-  try {
-    const actor = req.user;
-    if (actor.role !== 'ADMIN') {
-      return res.status(403).json({ error: 'صلاحية إضافة الأقسام محصورة بمدير النظام فقط' });
-    }
-
-    const { department_id, name, code } = req.body;
-    if (!name || !name.trim()) {
-      return res.status(400).json({ error: 'يرجى إدخال اسم القسم' });
-    }
-
-    const newDeptId = department_id || ('DEPT-' + crypto.randomBytes(3).toString('hex').toUpperCase());
-    const insertRes = await pool.query(
-      INSERT INTO departments (department_id, name, code, is_deleted, created_at)
-       VALUES (, , , FALSE, NOW())
-       ON CONFLICT (department_id) DO UPDATE SET
-         name = EXCLUDED.name,
-         is_deleted = FALSE
-       RETURNING *,
-      [newDeptId, String(name).trim(), code || newDeptId]
-    );
-
-    await logAudit('CREATE_DEPARTMENT', 'departments', newDeptId, actor.id || actor.user_id, actor.full_name, { name });
-    res.status(201).json({ success: true, message: 'تم حفظ القسم في السحابة بنجاح', data: insertRes.rows[0], department: insertRes.rows[0] });
-  } catch (err) {
-    console.error('Create Department Error:', err);
-    res.status(500).json({ error: 'حدث خطأ أثناء حفظ القسم على السيرفر' });
-  }
-});
-
-// ==============================================================================
-// إدارة أسطول العجلات (إنشاء وحفظ دائم في قاعدة البيانات)
-// ==============================================================================
-app.get(['/api/vehicles', '/api/admin/vehicles'], async (req, res) => {
-  try {
-    const r = await pool.query('SELECT * FROM vehicles WHERE is_deleted = FALSE ORDER BY plate_number ASC');
-    res.json({ success: true, data: r.rows, vehicles: r.rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post(['/api/vehicles', '/api/admin/vehicles', '/api/admin/vehicles/add', '/api/admin/vehicles/update'], authenticateToken, async (req, res) => {
-  try {
-    const { vehicle_id, id, plate_number, plate, vehicle_type, department_id, current_km, is_active } = req.body;
-    const finalPlate = String(plate_number || plate || vehicle_id || id || '').trim();
-    if (!finalPlate) {
-      return res.status(400).json({ error: 'يرجى إدخال رقم العجلة أو اللوحة' });
-    }
-
-    const newVehId = vehicle_id || id || finalPlate;
-    const insertRes = await pool.query(
-      INSERT INTO vehicles (vehicle_id, plate_number, vehicle_type, department_id, current_km, is_active, is_deleted, created_at)
-       VALUES (, , , , , , FALSE, NOW())
-       ON CONFLICT (vehicle_id) DO UPDATE SET
-         plate_number = EXCLUDED.plate_number,
-         vehicle_type = EXCLUDED.vehicle_type,
-         department_id = EXCLUDED.department_id,
-         current_km = EXCLUDED.current_km,
-         is_active = EXCLUDED.is_active,
-         is_deleted = FALSE,
-         updated_at = NOW()
-       RETURNING *,
-      [newVehId, finalPlate, vehicle_type || 'عجلة', department_id || null, parseInt(current_km, 10) || 0, is_active !== false && is_active !== 0]
-    );
-
-    res.status(201).json({ success: true, message: 'تم حفظ العجلة بنجاح', data: insertRes.rows[0], vehicle: insertRes.rows[0] });
-  } catch (err) {
-    console.error('Create Vehicle Error:', err);
-    res.status(500).json({ error: 'حدث خطأ أثناء حفظ العجلة على السيرفر' });
-  }
-});
-
-// ==============================================================================
-// إدارة المستخدمين (إنشاء وتعديل وحفظ دائم في قاعدة البيانات)
+// 7. إدارة وتحديث وحذف المستخدمين (Users Management - Admin Only)
 // ==============================================================================
 app.get(['/api/users', '/api/admin/users'], authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      SELECT user_id, username, full_name, role, department_id, unit, is_active, 
-              is_read_only, can_add_transaction, is_department_manager, 
-              assigned_department_id, can_add_dept_members_transactions, is_deleted, created_at
-       FROM users WHERE is_deleted = FALSE ORDER BY created_at DESC
+      `SELECT u.user_id, u.username, u.full_name, u.role, u.department_id, u.unit, u.is_active, 
+              u.is_read_only, u.can_add_transaction, u.is_department_manager, 
+              u.assigned_department_id, u.can_add_dept_members_transactions, u.is_deleted, u.created_at,
+              d.name as department_name
+       FROM users u
+       LEFT JOIN departments d ON u.department_id = d.department_id
+       WHERE u.is_deleted = FALSE 
+       ORDER BY u.created_at DESC`
     );
     res.json({ success: true, data: result.rows, users: result.rows });
   } catch (err) {
@@ -584,10 +684,11 @@ app.get(['/api/users', '/api/admin/users'], authenticateToken, async (req, res) 
   }
 });
 
+// إضافة مستخدم جديد (حقل القسم إلزامي)
 app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/users/create'], authenticateToken, async (req, res) => {
   try {
     const actor = req.user;
-    if (actor.role !== 'ADMIN') {
+    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
       return res.status(403).json({ error: 'صلاحية إضافة المستخدمين محصورة بمدير النظام فقط' });
     }
 
@@ -608,13 +709,17 @@ app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/
       can_add_dept_members_transactions
     } = req.body;
 
+    const finalDept = department_id || department;
     if (!username || !full_name) {
       return res.status(400).json({ error: 'يرجى إدخال اسم المستخدم والاسم الكامل' });
+    }
+    if (!finalDept && (role || '').toUpperCase() !== 'ADMIN') {
+      return res.status(400).json({ error: 'يرجى تحديد القسم التابع له المستخدم (حقل القسم إلزامي)' });
     }
 
     const cleanUsername = String(username).trim();
     const dupCheck = await pool.query(
-      'SELECT user_id FROM users WHERE LOWER(username) = LOWER() AND is_deleted = FALSE',
+      'SELECT user_id FROM users WHERE LOWER(username) = LOWER($1) AND is_deleted = FALSE',
       [cleanUsername]
     );
     if (dupCheck.rows.length > 0) {
@@ -624,49 +729,386 @@ app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/
     const newUserId = user_id || ('USR-' + crypto.randomBytes(3).toString('hex').toUpperCase());
     const passHash = hashPassword(password || '123');
 
-    const finalDept = department_id || department || null;
     const insertRes = await pool.query(
-      INSERT INTO users (
+      `INSERT INTO users (
         user_id, username, password_hash, full_name, role, department_id, unit,
         is_active, is_read_only, can_add_transaction, is_department_manager,
         assigned_department_id, can_add_dept_members_transactions, is_deleted, created_at
-      ) VALUES (, , , , , , , , , , , , , FALSE, NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, NOW())
       RETURNING user_id, username, full_name, role, department_id, unit, is_active,
-                is_read_only, can_add_transaction, is_department_manager, assigned_department_id,
+                is_read_only, can_add_transaction, is_department_manager, assigned_department_id`,
       [
         newUserId,
         cleanUsername,
         passHash,
         String(full_name).trim(),
         role || 'USER',
-        finalDept,
+        finalDept || null,
         unit || '',
         is_active !== false && is_active !== 0,
         Boolean(is_read_only),
         can_add_transaction !== false && can_add_transaction !== 0,
         Boolean(is_department_manager),
-        assigned_department_id || finalDept,
+        assigned_department_id || finalDept || null,
         Boolean(can_add_dept_members_transactions)
       ]
     );
 
     await logAudit('CREATE_USER', 'users', newUserId, actor.id || actor.user_id, actor.full_name, { username: cleanUsername });
-    res.status(201).json({ success: true, message: 'تم حفظ المستخدم في السحابة بنجاح', data: insertRes.rows[0], user: insertRes.rows[0] });
+    res.status(201).json({ success: true, message: 'تم حفظ المستخدم بنجاح', user: insertRes.rows[0] });
   } catch (err) {
     console.error('Create User Error:', err);
-    res.status(500).json({ error: 'حدث خطأ أثناء حفظ المستخدم على السيرفر' });
+    res.status(500).json({ error: 'حدث خطأ أثناء حفظ المستخدم: ' + (err.message || err) });
+  }
+});
+
+// تعديل بيانات المستخدم (Admin Only)
+app.put(['/api/users/:id', '/api/admin/users/:id', '/api/admin/users/update'], authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
+      return res.status(403).json({ error: 'صلاحية تعديل المستخدمين محصورة بمدير النظام فقط' });
+    }
+
+    const targetId = req.params.id || req.body.user_id || req.body.id;
+    const {
+      username,
+      password,
+      full_name,
+      role,
+      department_id,
+      unit,
+      is_active,
+      is_read_only,
+      can_add_transaction,
+      is_department_manager,
+      assigned_department_id,
+      can_add_dept_members_transactions
+    } = req.body;
+
+    const existing = await pool.query('SELECT * FROM users WHERE user_id = $1 AND is_deleted = FALSE', [targetId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'المستخدم غير موجود' });
+    }
+
+    const updates = [];
+    const values = [];
+    let idx = 1;
+
+    if (username) {
+      updates.push(`username = $${idx++}`);
+      values.push(String(username).trim());
+    }
+    if (password && String(password).trim().length > 0) {
+      updates.push(`password_hash = $${idx++}`);
+      values.push(hashPassword(password));
+    }
+    if (full_name) {
+      updates.push(`full_name = $${idx++}`);
+      values.push(String(full_name).trim());
+    }
+    if (role) {
+      updates.push(`role = $${idx++}`);
+      values.push(role);
+    }
+    if (department_id !== undefined) {
+      updates.push(`department_id = $${idx++}`);
+      values.push(department_id || null);
+    }
+    if (unit !== undefined) {
+      updates.push(`unit = $${idx++}`);
+      values.push(unit);
+    }
+    if (is_active !== undefined) {
+      updates.push(`is_active = $${idx++}`);
+      values.push(Boolean(is_active));
+    }
+    if (is_read_only !== undefined) {
+      updates.push(`is_read_only = $${idx++}`);
+      values.push(Boolean(is_read_only));
+    }
+    if (can_add_transaction !== undefined) {
+      updates.push(`can_add_transaction = $${idx++}`);
+      values.push(Boolean(can_add_transaction));
+    }
+    if (is_department_manager !== undefined) {
+      updates.push(`is_department_manager = $${idx++}`);
+      values.push(Boolean(is_department_manager));
+    }
+    if (assigned_department_id !== undefined) {
+      updates.push(`assigned_department_id = $${idx++}`);
+      values.push(assigned_department_id || department_id || null);
+    }
+    if (can_add_dept_members_transactions !== undefined) {
+      updates.push(`can_add_dept_members_transactions = $${idx++}`);
+      values.push(Boolean(can_add_dept_members_transactions));
+    }
+
+    if (updates.length === 0) {
+      return res.json({ success: true, message: 'لا توجد تعديلات مرسلة', user: existing.rows[0] });
+    }
+
+    values.push(targetId);
+    const q = `UPDATE users SET ${updates.join(', ')} WHERE user_id = $${idx} RETURNING user_id, username, full_name, role, department_id, unit, is_active`;
+    const updRes = await pool.query(q, values);
+
+    await logAudit('UPDATE_USER', 'users', targetId, actor.id || actor.user_id, actor.full_name, req.body);
+    res.json({ success: true, message: 'تم تعديل بيانات المستخدم بنجاح', user: updRes.rows[0] });
+  } catch (err) {
+    console.error('Update User Error:', err);
+    res.status(500).json({ error: 'حدث خطأ أثناء تعديل المستخدم: ' + (err.message || err) });
   }
 });
 
 // ==============================================================================
-// 6.3 Soft Delete & Deleted Records Pipeline (SRS Axis 3 & 4)
+// 8. إدارة وتعديل وحذف أسطول العجلات (Fleet Management)
 // ==============================================================================
+app.get(['/api/vehicles', '/api/admin/vehicles'], authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    
+    let query = `
+      SELECT v.*, d.name as department_name 
+      FROM vehicles v
+      LEFT JOIN departments d ON v.department_id = d.department_id
+      WHERE v.is_deleted = FALSE
+    `;
+    const params = [];
 
+    // عزل العجلات حسب القسم:
+    if (actorRole === 'USER') {
+      // المستخدم يرى العجلات النشطة التابعة لقسمه فقط
+      const dept = actor.assigned_department_id || actor.department_id;
+      params.push(dept);
+      query += ` AND v.is_active = TRUE AND v.department_id = $${params.length}`;
+    } else if (actorRole === 'DEPARTMENT_HEAD') {
+      // مسؤول القسم يرى عجلات قسمه
+      const dept = actor.assigned_department_id || actor.department_id;
+      params.push(dept);
+      query += ` AND v.department_id = $${params.length}`;
+    }
+    // الأدمن والمدقق يريان كافة عجلات الأسطول
+
+    query += ` ORDER BY v.plate_number ASC`;
+    const r = await pool.query(query, params);
+    res.json({ success: true, data: r.rows, vehicles: r.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// تعديل عجلة (Admin Only)
+app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
+      return res.status(403).json({ error: 'صلاحية تعديل العجلات محصورة بمدير النظام فقط' });
+    }
+
+    const vehId = req.params.id;
+    const { plate_number, vehicle_type, department_id, current_km, is_active } = req.body;
+
+    const updates = [];
+    const values = [];
+    let idx = 1;
+
+    if (plate_number) {
+      updates.push(`plate_number = $${idx++}`);
+      values.push(String(plate_number).trim());
+    }
+    if (vehicle_type !== undefined) {
+      updates.push(`vehicle_type = $${idx++}`);
+      values.push(vehicle_type);
+    }
+    if (department_id !== undefined) {
+      updates.push(`department_id = $${idx++}`);
+      values.push(department_id || null);
+    }
+    if (current_km !== undefined) {
+      updates.push(`current_km = $${idx++}`);
+      values.push(parseInt(current_km, 10) || 0);
+    }
+    if (is_active !== undefined) {
+      updates.push(`is_active = $${idx++}`);
+      values.push(Boolean(is_active));
+    }
+
+    if (updates.length === 0) {
+      return res.json({ success: true, message: 'لا توجد تعديلات' });
+    }
+
+    updates.push(`updated_at = NOW()`);
+    values.push(vehId);
+
+    const q = `UPDATE vehicles SET ${updates.join(', ')} WHERE vehicle_id = $${idx} AND is_deleted = FALSE RETURNING *`;
+    const updRes = await pool.query(q, values);
+
+    if (updRes.rows.length === 0) {
+      return res.status(404).json({ error: 'العجلة غير موجودة' });
+    }
+
+    await logAudit('UPDATE_VEHICLE', 'vehicles', vehId, actor.id || actor.user_id, actor.full_name, req.body);
+    res.json({ success: true, message: 'تم تعديل بيانات العجلة بنجاح', vehicle: updRes.rows[0] });
+  } catch (err) {
+    console.error('Update Vehicle Error:', err);
+    res.status(500).json({ error: 'حدث خطأ أثناء تعديل العجلة: ' + (err.message || err) });
+  }
+});
+
+// إضافة عجلة جديدة (Admin Only)
+app.post(['/api/vehicles', '/api/admin/vehicles', '/api/admin/vehicles/add'], authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
+      return res.status(403).json({ error: 'صلاحية إضافة العجلات محصورة بمدير النظام فقط' });
+    }
+
+    const { vehicle_id, id, plate_number, plate, vehicle_type, department_id, current_km, is_active } = req.body;
+    const finalPlate = String(plate_number || plate || vehicle_id || id || '').trim();
+    if (!finalPlate) {
+      return res.status(400).json({ error: 'يرجى إدخال رقم العجلة أو اللوحة' });
+    }
+
+    const newVehId = vehicle_id || id || finalPlate;
+    const insertRes = await pool.query(
+      `INSERT INTO vehicles (vehicle_id, plate_number, vehicle_type, department_id, current_km, is_active, is_deleted, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, FALSE, NOW())
+       ON CONFLICT (vehicle_id) DO UPDATE SET
+         plate_number = EXCLUDED.plate_number,
+         vehicle_type = EXCLUDED.vehicle_type,
+         department_id = EXCLUDED.department_id,
+         current_km = EXCLUDED.current_km,
+         is_active = EXCLUDED.is_active,
+         is_deleted = FALSE,
+         updated_at = NOW()
+       RETURNING *`,
+      [newVehId, finalPlate, vehicle_type || 'عجلة', department_id || null, parseInt(current_km, 10) || 0, is_active !== false && is_active !== 0]
+    );
+
+    res.status(201).json({ success: true, message: 'تم حفظ العجلة بنجاح', data: insertRes.rows[0], vehicle: insertRes.rows[0] });
+  } catch (err) {
+    console.error('Create Vehicle Error:', err);
+    res.status(500).json({ error: 'حدث خطأ أثناء حفظ العجلة على السيرفر' });
+  }
+});
+
+// ==============================================================================
+// 9. تقرير سجل صيانة العجلات الشامل للأدمن (Vehicle Maintenance Dossier)
+// ==============================================================================
+app.get('/api/reports/vehicle-history', authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    if (actorRole !== 'ADMIN') {
+      return res.status(403).json({ error: 'عذراً، هذا التقرير مخصص لمدير النظام فقط' });
+    }
+
+    const { wheel_id } = req.query;
+
+    let query = `
+      SELECT t.*, 
+             COALESCE(t.cost, 0) as maintenance_price,
+             COALESCE(t.mileage, 0) as current_km,
+             u.full_name as user_name,
+             d.name as department_name
+      FROM transactions t
+      LEFT JOIN users u ON t.user_id = u.user_id
+      LEFT JOIN departments d ON t.department_id = d.department_id
+      WHERE t.is_deleted = FALSE
+    `;
+    const params = [];
+
+    if (wheel_id && wheel_id.trim() !== '') {
+      params.push(wheel_id.trim());
+      query += ` AND t.wheel_id = $${params.length}`;
+    }
+
+    query += ` ORDER BY t.created_at DESC`;
+    const txRes = await pool.query(query, params);
+
+    // حساب الإحصائيات
+    let totalCount = txRes.rows.length;
+    let totalCost = 0;
+    let lastKm = 0;
+
+    for (const r of txRes.rows) {
+      if (r.status === 'AUDITED') {
+        totalCost += parseFloat(r.cost || 0);
+      }
+      if (r.mileage && r.mileage > lastKm) {
+        lastKm = r.mileage;
+      }
+    }
+
+    res.json({
+      success: true,
+      summary: {
+        total_count: totalCount,
+        total_cost: totalCost,
+        last_km: lastKm,
+        wheel_id: wheel_id || 'ALL'
+      },
+      transactions: txRes.rows
+    });
+  } catch (err) {
+    console.error('Vehicle History Report Error:', err);
+    res.status(500).json({ error: 'فشل استخراج التقرير: ' + (err.message || err) });
+  }
+});
+
+// ==============================================================================
+// 10. نظام الإشعارات الفورية (Notifications API)
+// ==============================================================================
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  try {
+    const actorId = req.user.id || req.user.user_id;
+    const notifs = await pool.query(
+      `SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      [actorId]
+    );
+    res.json({ success: true, count: notifs.rows.length, notifications: notifs.rows });
+  } catch (err) {
+    console.error('Fetch Notifications Error:', err);
+    res.status(500).json({ error: 'فشل جلب الإشعارات' });
+  }
+});
+
+app.post('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const actorId = req.user.id || req.user.user_id;
+    const notifId = req.params.id;
+    await pool.query(
+      `UPDATE notifications SET is_read = TRUE WHERE notification_id = $1 AND user_id = $2`,
+      [notifId, actorId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل تحديث حالة الإشعار' });
+  }
+});
+
+app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
+  try {
+    const actorId = req.user.id || req.user.user_id;
+    await pool.query(
+      `UPDATE notifications SET is_read = TRUE WHERE user_id = $1`,
+      [actorId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل تحديث الإشعارات' });
+  }
+});
+
+// ==============================================================================
+// 11. الحذف المنطقي وسلة المحذوفات (Soft Delete Pipeline)
+// ==============================================================================
 async function executeSoftDelete(req, res, { tableName, idColumn, entityType, recordId, successMsg }) {
   try {
     const actor = req.user;
-    if (actor.role !== 'ADMIN' && !actor.is_department_manager) {
-      return res.status(403).json({ error: 'ليس لديك صلاحية تنفيذ الحذف' });
+    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
+      return res.status(403).json({ error: 'ليس لديك صلاحية تنفيذ الحذف، الحذف محصور بمدير النظام' });
     }
 
     const existing = await pool.query(
@@ -700,7 +1142,23 @@ async function executeSoftDelete(req, res, { tableName, idColumn, entityType, re
   }
 }
 
-// 1. حذف عجلة
+// حذف مستخدم (يمنع حذف الحساب الشخصي أو حساب admin الرئيسي)
+app.delete(['/api/users/:id', '/api/admin/users/:id'], authenticateToken, (req, res) => {
+  const targetId = req.params.id;
+  const actorId = req.user.id || req.user.user_id;
+  if (String(targetId) === String(actorId) || targetId === 'USR-ADMIN-001' || targetId === 'admin') {
+    return res.status(400).json({ error: 'لا يمكنك حذف حسابك الشخصي أو حساب مدير النظام الرئيسي' });
+  }
+  return executeSoftDelete(req, res, {
+    tableName: 'users',
+    idColumn: 'user_id',
+    entityType: 'user',
+    recordId: targetId,
+    successMsg: 'تم نقل المستخدم إلى جدول المحذوفات بنجاح'
+  });
+});
+
+// حذف عجلة
 app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, (req, res) =>
   executeSoftDelete(req, res, {
     tableName: 'vehicles',
@@ -710,85 +1168,31 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
     successMsg: 'تم نقل العجلة إلى جدول المحذوفات بنجاح'
   })
 );
-app.post('/api/admin/vehicles/delete', authenticateToken, (req, res) => {
-  const id = req.body.vehicle_id || req.body.id || req.body.plate;
-  return executeSoftDelete(req, res, {
-    tableName: 'vehicles',
-    idColumn: 'vehicle_id',
-    entityType: 'vehicle',
-    recordId: id,
-    successMsg: 'تم نقل العجلة إلى جدول المحذوفات بنجاح'
-  });
-});
 
-// 2. حذف مستخدم
-app.delete(['/api/users/:id', '/api/admin/users/:id'], authenticateToken, (req, res) => {
-  const targetId = req.params.id;
-  if (String(targetId) === String(req.user.id || req.user.user_id)) {
-    return res.status(400).json({ error: 'لا يمكنك حذف حسابك الشخصي أثناء تسجيل الدخول' });
-  }
-  return executeSoftDelete(req, res, {
-    tableName: 'users',
-    idColumn: 'user_id',
-    entityType: 'user',
-    recordId: targetId,
-    successMsg: 'تم نقل المستخدم إلى جدول المحذوفات بنجاح'
-  });
-});
-app.post('/api/admin/users/delete', authenticateToken, (req, res) => {
-  const targetId = req.body.user_id || req.body.id || req.body.username;
-  if (String(targetId) === String(req.user.id || req.user.user_id)) {
-    return res.status(400).json({ error: 'لا يمكنك حذف حسابك الشخصي أثناء تسجيل الدخول' });
-  }
-  return executeSoftDelete(req, res, {
-    tableName: 'users',
-    idColumn: 'user_id',
-    entityType: 'user',
-    recordId: targetId,
-    successMsg: 'تم نقل المستخدم إلى جدول المحذوفات بنجاح'
-  });
-});
-
-// 3. حذف قسم
-app.delete(['/api/departments/:id', '/api/admin/departments/:id'], authenticateToken, (req, res) =>
+// حذف معاملة
+app.delete('/api/transactions/:id', authenticateToken, (req, res) =>
   executeSoftDelete(req, res, {
-    tableName: 'departments',
-    idColumn: 'department_id',
-    entityType: 'department',
+    tableName: 'transactions',
+    idColumn: 'transaction_id',
+    entityType: 'transaction',
     recordId: req.params.id,
-    successMsg: 'تم نقل القسم إلى جدول المحذوفات بنجاح'
+    successMsg: 'تم نقل المعاملة إلى سلة المحذوفات بنجاح'
   })
 );
-app.post('/api/admin/departments/delete', authenticateToken, (req, res) => {
-  const id = req.body.department_id || req.body.id || req.body.name;
-  return executeSoftDelete(req, res, {
-    tableName: 'departments',
-    idColumn: 'department_id',
-    entityType: 'department',
-    recordId: id,
-    successMsg: 'تم نقل القسم إلى جدول المحذوفات بنجاح'
-  });
-});
 
-// 4. جلب سجل المحذوفات
+// جلب المحذوفات واستعادتها
 app.get(['/api/deleted-records', '/api/admin/recycle-bin'], authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM deleted_records ORDER BY deleted_at DESC LIMIT 500`
-    );
+    const result = await pool.query(`SELECT * FROM deleted_records ORDER BY deleted_at DESC LIMIT 500`);
     res.json({ success: true, count: result.rows.length, data: result.rows, deleted_records: result.rows });
   } catch (err) {
-    console.error('Fetch Deleted Records Error:', err);
     res.status(500).json({ error: 'فشل جلب سجل المحذوفات من السيرفر' });
   }
 });
 
-// 5. استعادة سجل محذوف
 app.post(['/api/deleted-records/:id/restore', '/api/admin/recycle-bin/restore'], authenticateToken, async (req, res) => {
   try {
     const recordPk = req.params.id || req.body.id || req.body.trashId;
-    const actor = req.user;
-
     const delRes = await pool.query('SELECT * FROM deleted_records WHERE id = $1', [recordPk]);
     if (delRes.rows.length === 0) {
       return res.status(404).json({ error: 'السجل المحذوف غير موجود' });
@@ -803,116 +1207,128 @@ app.post(['/api/deleted-records/:id/restore', '/api/admin/recycle-bin/restore'],
     };
 
     const target = tableMap[item.entity_type];
-    if (!target) {
-      return res.status(400).json({ error: 'نوع السجل غير مدعوم للاستعادة' });
-    }
+    if (!target) return res.status(400).json({ error: 'نوع السجل غير مدعوم للاستعادة' });
 
     await pool.query(
       `UPDATE ${target.table} SET is_deleted = FALSE, deleted_at = NULL, deleted_by = NULL WHERE ${target.col} = $1`,
       [item.entity_id]
     );
-
     await pool.query('DELETE FROM deleted_records WHERE id = $1', [recordPk]);
 
     res.json({ success: true, message: 'تمت استعادة السجل بنجاح وإعادته إلى القائمة النشطة' });
   } catch (err) {
-    console.error('Restore Record Error:', err);
-    res.status(500).json({ error: 'فشل استعادة السجل من السيرفر' });
+    res.status(500).json({ error: 'فشل استعادة السجل' });
   }
 });
 
-// 6. اعتماد أو تعديل حالة المعاملة للمدقق والأدمن
-app.put(['/api/transactions/:id', '/api/transactions/:id/status', '/api/transactions/:id/approve'], authenticateToken, async (req, res) => {
+// ==============================================================================
+// 12. إدارة الأقسام
+// ==============================================================================
+app.get(['/api/departments', '/api/admin/departments'], async (req, res) => {
   try {
-    const txId = req.params.id;
-    const body = req.body;
+    const result = await pool.query('SELECT * FROM departments WHERE is_deleted = FALSE ORDER BY created_at DESC');
+    res.json({ success: true, data: result.rows, departments: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل جلب الأقسام' });
+  }
+});
+
+app.post(['/api/departments', '/api/admin/departments'], authenticateToken, async (req, res) => {
+  try {
     const actor = req.user;
+    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
+      return res.status(403).json({ error: 'صلاحية إضافة الأقسام محصورة بمدير النظام فقط' });
+    }
+
+    const { department_id, name, code } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'يرجى إدخال اسم القسم' });
+    }
+
+    const newDeptId = department_id || ('DEPT-' + crypto.randomBytes(3).toString('hex').toUpperCase());
+    const insertRes = await pool.query(
+      `INSERT INTO departments (department_id, name, code, is_deleted, created_at)
+       VALUES ($1, $2, $3, FALSE, NOW())
+       ON CONFLICT (department_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         is_deleted = FALSE
+       RETURNING *`,
+      [newDeptId, String(name).trim(), code || newDeptId]
+    );
+
+    res.status(201).json({ success: true, message: 'تم حفظ القسم بنجاح', department: insertRes.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'حدث خطأ أثناء حفظ القسم' });
+  }
+});
+
+// ==============================================================================
+// 13. المزامنة السحابية الشاملة للهواتف (Full Sync)
+// ==============================================================================
+app.get('/api/sync', authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
     const actorId = actor.id || actor.user_id;
 
-    const updates = [];
-    const values = [];
-    let pIdx = 1;
+    const depts = await pool.query('SELECT * FROM departments WHERE is_deleted = FALSE ORDER BY created_at DESC');
+    
+    // عزل العجلات في المزامنة:
+    let vehQuery = 'SELECT * FROM vehicles WHERE is_deleted = FALSE';
+    const vehParams = [];
+    if (actorRole === 'USER') {
+      const dept = actor.assigned_department_id || actor.department_id;
+      vehParams.push(dept);
+      vehQuery += ` AND is_active = TRUE AND department_id = $${vehParams.length}`;
+    } else if (actorRole === 'DEPARTMENT_HEAD') {
+      const dept = actor.assigned_department_id || actor.department_id;
+      vehParams.push(dept);
+      vehQuery += ` AND department_id = $${vehParams.length}`;
+    }
+    vehQuery += ' ORDER BY plate_number ASC';
+    const vehs = await pool.query(vehQuery, vehParams);
 
-    const wheelId = body.wheel_id || body.vehicle_id || body.plate_number;
-    if (wheelId !== undefined) {
-      updates.push(`wheel_id = $${pIdx++}`);
-      values.push(wheelId);
-    }
-    const cost = body.cost !== undefined ? body.cost : body.maintenance_price;
-    if (cost !== undefined) {
-      updates.push(`cost = $${pIdx++}`);
-      values.push(parseFloat(cost) || 0);
-    }
-    const mileage = body.mileage !== undefined ? body.mileage : body.current_km;
-    if (mileage !== undefined) {
-      updates.push(`mileage = $${pIdx++}`);
-      values.push(parseInt(mileage, 10) || 0);
-    }
-    const desc = body.description !== undefined ? body.description : body.notes;
-    if (desc !== undefined) {
-      updates.push(`description = $${pIdx++}`);
-      values.push(desc);
-    }
-    if (body.category !== undefined) {
-      updates.push(`category = $${pIdx++}`);
-      values.push(body.category);
-    }
-    if (body.receipt_image !== undefined) {
-      updates.push(`receipt_image = $${pIdx++}`);
-      values.push(body.receipt_image);
-    }
-    if (body.receipt_images !== undefined) {
-      updates.push(`receipt_images = $${pIdx++}`);
-      values.push(JSON.stringify(body.receipt_images));
-    }
-    if (body.vehicle_images !== undefined) {
-      updates.push(`vehicle_images = $${pIdx++}`);
-      values.push(JSON.stringify(body.vehicle_images));
-    }
-    if (body.status !== undefined) {
-      updates.push(`status = $${pIdx++}`);
-      values.push(body.status);
-    }
-    if (body.auditor_note !== undefined) {
-      updates.push(`auditor_note = $${pIdx++}`);
-      values.push(body.auditor_note);
-    }
-    if (body.admin_note !== undefined) {
-      updates.push(`admin_note = $${pIdx++}`);
-      values.push(body.admin_note);
-    }
-    if (body.is_locked !== undefined) {
-      updates.push(`is_locked = $${pIdx++}`);
-      values.push(Boolean(body.is_locked));
-    }
+    const users = await pool.query(
+      `SELECT user_id, username, full_name, department_id, unit, role, is_active,
+              is_read_only, can_add_transaction, is_department_manager, assigned_department_id,
+              can_add_dept_members_transactions, is_deleted, created_at
+       FROM users WHERE is_deleted = FALSE ORDER BY created_at DESC`
+    );
 
-    if (actor.role === 'AUDITOR') {
-      updates.push(`audited_by_auditor_at = NOW()`);
-    } else if (actor.role === 'ADMIN') {
-      updates.push(`audited_at = NOW()`);
+    let txQuery = `
+      SELECT t.*, u.full_name as user_name, d.name as department_name
+      FROM transactions t
+      LEFT JOIN users u ON t.user_id = u.user_id
+      LEFT JOIN departments d ON t.department_id = d.department_id
+      WHERE t.is_deleted = FALSE
+    `;
+    const txParams = [];
+    if (actorRole === 'USER') {
+      txParams.push(actorId);
+      txQuery += ` AND (t.user_id = $${txParams.length} OR t.created_by = $${txParams.length})`;
+    } else if (actorRole === 'DEPARTMENT_HEAD') {
+      const dept = actor.assigned_department_id || actor.department_id;
+      txParams.push(dept);
+      txQuery += ` AND t.department_id = $${txParams.length}`;
     }
+    txQuery += ` ORDER BY t.created_at DESC LIMIT 1000`;
+    const txs = await pool.query(txQuery, txParams);
 
-    updates.push(`updated_by = $${pIdx++}`);
-    values.push(actorId);
-
-    updates.push(`updated_at = NOW()`);
-    values.push(txId);
-
-    const q = `UPDATE transactions SET ${updates.join(', ')} WHERE transaction_id = $${pIdx} AND is_deleted = FALSE RETURNING *`;
-    const r = await pool.query(q, values);
-
-    if (r.rows.length === 0) {
-      return res.status(404).json({ error: 'المعاملة غير موجودة أو تم حذفها' });
-    }
-
-    res.json({ success: true, transaction: r.rows[0], message: 'تم تحديث حالة المعاملة بنجاح' });
+    res.json({
+      success: true,
+      server_time: new Date().toISOString(),
+      departments: depts.rows,
+      vehicles: vehs.rows,
+      users: users.rows,
+      transactions: txs.rows
+    });
   } catch (err) {
-    console.error('Update Tx Status Error:', err);
-    res.status(500).json({ error: 'فشل تحديث حالة المعاملة: ' + (err.message || err) });
+    console.error('Sync Error:', err);
+    res.status(500).json({ error: 'فشلت عملية المزامنة السحابية' });
   }
 });
 
-// 7. مزامنة المعاملات ورفع طابور الأوفلاين
+// رفع طابور الأوفلاين
 app.post('/api/sync/push', authenticateToken, async (req, res) => {
   try {
     const items = req.body.items || [];
@@ -920,7 +1336,6 @@ app.post('/api/sync/push', authenticateToken, async (req, res) => {
     let savedCount = 0;
 
     for (const item of items) {
-      // 1. Transaction upsert with Supabase matching schema
       if (item.transaction_id) {
         const wheelId = item.wheel_id || item.vehicle_id || item.plate_number || 'عجلة غير محددة';
         const cost = item.cost !== undefined ? item.cost : (item.maintenance_price || 0);
@@ -979,261 +1394,20 @@ app.post('/api/sync/push', authenticateToken, async (req, res) => {
           item.department_id || actor.department_id || null
         ]);
         savedCount++;
-        continue;
-      }
-
-      // 2. Polymorphic queue action
-      const action = String(item.action || '').toUpperCase();
-      if (action === 'CREATE_DEPARTMENT') {
-        const dId = item.department_id || ('DEPT-' + crypto.randomBytes(3).toString('hex').toUpperCase());
-        const dName = String(item.name || '').trim();
-        if (dName) {
-          await pool.query(
-            `INSERT INTO departments (department_id, name, code, is_deleted, created_at)
-             VALUES ($1, $2, $1, FALSE, NOW())
-             ON CONFLICT (department_id) DO UPDATE SET name = EXCLUDED.name, is_deleted = FALSE`,
-            [dId, dName]
-          );
-          savedCount++;
-        }
-      } else if (action === 'CREATE_USER') {
-        const u = item.payload || item;
-        const uId = u.user_id || ('USR-' + crypto.randomBytes(3).toString('hex').toUpperCase());
-        const uName = String(u.username || '').trim();
-        if (uName) {
-          const passHash = hashPassword(u.password || '123');
-          await pool.query(
-            `INSERT INTO users (
-              user_id, username, password_hash, full_name, role, department_id, unit,
-              is_active, is_read_only, can_add_transaction, is_department_manager,
-              assigned_department_id, can_add_dept_members_transactions, is_deleted, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, NOW())
-            ON CONFLICT (username) DO UPDATE SET
-              full_name = EXCLUDED.full_name,
-              role = EXCLUDED.role,
-              department_id = EXCLUDED.department_id,
-              is_active = EXCLUDED.is_active,
-              is_deleted = FALSE`,
-            [
-              uId, uName, passHash, String(u.full_name || uName).trim(),
-              u.role || 'USER', u.department_id || u.department || null, u.unit || '',
-              u.is_active !== false && u.is_active !== 0, Boolean(u.is_read_only),
-              u.can_add_transaction !== false && u.can_add_transaction !== 0,
-              Boolean(u.is_department_manager), u.assigned_department_id || null,
-              Boolean(u.can_add_dept_members_transactions)
-            ]
-          );
-          savedCount++;
-        }
-      } else if (action === 'CREATE_VEHICLE') {
-        const v = item.payload || item;
-        const plate = String(v.plate_number || v.plate || '').trim();
-        if (plate) {
-          const vId = v.vehicle_id || plate;
-          await pool.query(
-            `INSERT INTO vehicles (vehicle_id, plate_number, vehicle_type, department_id, current_km, is_active, is_deleted, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, FALSE, NOW())
-             ON CONFLICT (vehicle_id) DO UPDATE SET
-               plate_number = EXCLUDED.plate_number,
-               vehicle_type = EXCLUDED.vehicle_type,
-               department_id = EXCLUDED.department_id,
-               current_km = EXCLUDED.current_km,
-               is_active = EXCLUDED.is_active,
-               is_deleted = FALSE,
-               updated_at = NOW()`,
-            [vId, plate, v.vehicle_type || 'عجلة', v.department_id || null, parseInt(v.current_km, 10) || 0, v.is_active !== false && v.is_active !== 0]
-          );
-          savedCount++;
-        }
-      } else if (action === 'DELETE') {
-        const entType = String(item.entity_type || '').toLowerCase();
-        const entId = String(item.entity_id || '').trim();
-        if (entId) {
-          if (entType === 'department') {
-            await pool.query('UPDATE departments SET is_deleted = TRUE, deleted_at = NOW() WHERE department_id = $1 OR name = $1', [entId]);
-          } else if (entType === 'user') {
-            await pool.query('UPDATE users SET is_deleted = TRUE, deleted_at = NOW() WHERE user_id = $1 OR username = $1', [entId]);
-          } else if (entType === 'vehicle') {
-            await pool.query('UPDATE vehicles SET is_deleted = TRUE, deleted_at = NOW() WHERE vehicle_id = $1 OR plate_number = $1', [entId]);
-          } else if (entType === 'transaction') {
-            await pool.query('UPDATE transactions SET is_deleted = TRUE, deleted_at = NOW() WHERE transaction_id = $1', [entId]);
-          }
-          savedCount++;
-        }
       }
     }
 
-    res.json({ success: true, count: savedCount, message: `تمت معالجة ومزامنة ${savedCount} عملية بنجاح ☁️` });
+    res.json({ success: true, count: savedCount, message: `تمت مزامنة ${savedCount} عملية بنجاح ☁️` });
   } catch (err) {
     console.error('Sync Push Error:', err);
-    res.status(500).json({ error: 'فشلت عملية المزامنة السحابية للبيانات: ' + (err.message || err) });
+    res.status(500).json({ error: 'فشلت المزامنة: ' + (err.message || err) });
   }
 });
-
-// 8. مسار التهيئة الأولية والرفع الشامل (Push-All Initial Setup)
-app.post('/api/sync/push-all', authenticateToken, async (req, res) => {
-  try {
-    const actor = req.user;
-    const { users = [], departments = [], vehicles = [], transactions = [] } = req.body;
-    let counts = { users: 0, departments: 0, vehicles: 0, transactions: 0 };
-
-    // 1. الأقسام
-    for (const d of departments) {
-      const dId = d.department_id || d.id || ('DEPT-' + crypto.randomBytes(3).toString('hex').toUpperCase());
-      const dName = String(d.name || '').trim();
-      if (dName) {
-        await pool.query(
-          `INSERT INTO departments (department_id, name, code, is_deleted, created_at)
-           VALUES ($1, $2, $3, FALSE, NOW())
-           ON CONFLICT (department_id) DO UPDATE SET 
-             name = EXCLUDED.name,
-             is_deleted = FALSE`,
-          [dId, dName, d.code || dId]
-        );
-        counts.departments++;
-      }
-    }
-
-    // 2. المستخدمون
-    for (const u of users) {
-      const uId = u.user_id || u.id || ('USR-' + crypto.randomBytes(3).toString('hex').toUpperCase());
-      const uName = String(u.username || '').trim();
-      if (uName) {
-        const passHash = u.password_hash || hashPassword(u.password || '123');
-        await pool.query(
-          `INSERT INTO users (
-            user_id, username, password_hash, full_name, role, department_id, unit,
-            is_active, is_read_only, can_add_transaction, is_department_manager,
-            assigned_department_id, can_add_dept_members_transactions, can_edit_dept_transactions,
-            is_deleted, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, FALSE, NOW())
-          ON CONFLICT (username) DO UPDATE SET
-            full_name = EXCLUDED.full_name,
-            role = EXCLUDED.role,
-            department_id = EXCLUDED.department_id,
-            is_active = EXCLUDED.is_active,
-            can_add_transaction = EXCLUDED.can_add_transaction,
-            is_deleted = FALSE`,
-          [
-            uId, uName, passHash, String(u.full_name || uName).trim(),
-            u.role || 'USER', u.department_id || null, u.unit || '',
-            u.is_active !== false && u.is_active !== 0, Boolean(u.is_read_only),
-            u.can_add_transaction !== false && u.can_add_transaction !== 0,
-            Boolean(u.is_department_manager), u.assigned_department_id || null,
-            Boolean(u.can_add_dept_members_transactions), Boolean(u.can_edit_dept_transactions)
-          ]
-        );
-        counts.users++;
-      }
-    }
-
-    // 3. العجلات
-    for (const v of vehicles) {
-      const plate = String(v.plate_number || v.plate || v.wheel_id || '').trim();
-      if (plate) {
-        const vId = v.vehicle_id || plate;
-        await pool.query(
-          `INSERT INTO vehicles (vehicle_id, plate_number, vehicle_type, department_id, current_km, is_active, is_deleted, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, FALSE, NOW())
-           ON CONFLICT (vehicle_id) DO UPDATE SET
-             plate_number = EXCLUDED.plate_number,
-             vehicle_type = EXCLUDED.vehicle_type,
-             department_id = EXCLUDED.department_id,
-             current_km = EXCLUDED.current_km,
-             is_active = EXCLUDED.is_active,
-             is_deleted = FALSE,
-             updated_at = NOW()`,
-          [
-            vId,
-            plate,
-            v.vehicle_type || 'عجلة',
-            v.department_id || null,
-            parseInt(v.current_km || v.mileage, 10) || 0,
-            v.is_active !== false && v.is_active !== 0
-          ]
-        );
-        counts.vehicles++;
-      }
-    }
-
-    // 4. المعاملات
-    for (const item of transactions) {
-      const txId = item.transaction_id || ('TX-' + new Date().getFullYear() + '-' + crypto.randomBytes(3).toString('hex').toUpperCase());
-      const wheelId = item.wheel_id || item.vehicle_id || item.plate_number || (Array.isArray(item.vehicle_numbers) && item.vehicle_numbers.length > 0 ? item.vehicle_numbers[0] : 'عجلة غير محددة');
-      const cost = item.cost !== undefined ? item.cost : (item.maintenance_price || 0);
-      const mileage = item.mileage !== undefined ? item.mileage : (item.current_km || 0);
-      const description = item.description !== undefined ? item.description : (item.notes || '');
-      const category = item.category || item.maintenance_type || 'إطارات وبطاريات';
-      const receipt_image = item.receipt_image || (Array.isArray(item.receipt_images) && item.receipt_images.length > 0 ? item.receipt_images[0] : null);
-      const receipt_images = item.receipt_images || (receipt_image ? [receipt_image] : []);
-      const vehicle_images = item.vehicle_images || [];
-      const status = item.status || 'PENDING_AUDITOR';
-      const is_locked = item.is_locked !== undefined ? Boolean(item.is_locked) : true;
-      const auditor_note = item.auditor_note || '';
-      const admin_note = item.admin_note || '';
-      const updated_by = item.updated_by || actor.id || actor.user_id;
-
-      const q = `
-        INSERT INTO transactions (
-          transaction_id, wheel_id, category, cost, mileage, description,
-          receipt_image, receipt_images, vehicle_images, status, auditor_note, admin_note,
-          is_locked, is_deleted, created_at, updated_at, updated_by, user_id, department_id
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, $14, NOW(), $15, $16, $17
-        ) ON CONFLICT (transaction_id) DO UPDATE SET
-          wheel_id = COALESCE(EXCLUDED.wheel_id, transactions.wheel_id),
-          category = COALESCE(EXCLUDED.category, transactions.category),
-          cost = COALESCE(EXCLUDED.cost, transactions.cost),
-          mileage = COALESCE(EXCLUDED.mileage, transactions.mileage),
-          description = COALESCE(EXCLUDED.description, transactions.description),
-          receipt_image = COALESCE(EXCLUDED.receipt_image, transactions.receipt_image),
-          receipt_images = COALESCE(EXCLUDED.receipt_images, transactions.receipt_images),
-          vehicle_images = COALESCE(EXCLUDED.vehicle_images, transactions.vehicle_images),
-          status = COALESCE(EXCLUDED.status, transactions.status),
-          auditor_note = COALESCE(EXCLUDED.auditor_note, transactions.auditor_note),
-          admin_note = COALESCE(EXCLUDED.admin_note, transactions.admin_note),
-          is_locked = COALESCE(EXCLUDED.is_locked, transactions.is_locked),
-          updated_by = EXCLUDED.updated_by,
-          updated_at = NOW()
-      `;
-      await pool.query(q, [
-        txId,
-        wheelId,
-        category,
-        parseFloat(cost) || 0.00,
-        parseInt(mileage, 10) || 0,
-        description,
-        receipt_image,
-        JSON.stringify(receipt_images),
-        JSON.stringify(vehicle_images),
-        status,
-        auditor_note,
-        admin_note,
-        is_locked,
-        item.created_at || new Date().toISOString(),
-        updated_by,
-        item.user_id || actor.id || actor.user_id,
-        item.department_id || actor.department_id || null
-      ]);
-      counts.transactions++;
-    }
-
-    res.json({
-      success: true,
-      message: `تم رفع ومزامنة التهيئة الأولية بنجاح (${counts.departments} قسم، ${counts.users} مستخدم، ${counts.vehicles} عجلة، ${counts.transactions} معاملة) ☁️`,
-      counts
-    });
-  } catch (err) {
-    console.error('Push All Error:', err);
-    res.status(500).json({ error: 'فشل رفع البيانات الأولية: ' + (err.message || err) });
-  }
-});
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`================================================================`);
-  console.log(`  سيرفر صيانة العجلات السحابي (Wheel Maintenance Cloud API)`);
+  console.log(`  سيرفر صيانة العجلات السحابي (Wheel Maintenance Cloud API) v5.0`);
   console.log(`  يعمل بنجاح على المنفذ: ${PORT}`);
   console.log(`  البيئة: ${process.env.NODE_ENV || 'production'}`);
   console.log(`================================================================`);
