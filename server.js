@@ -366,7 +366,7 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
   res.json({
     status: 'online',
     system: 'Wheel Maintenance Cloud API',
-    version: '6.1.2 (Fleet Integrity, Cascade Transfers & Smart Alerts Full)',
+    version: '6.2.0 (Category Management, Aggregated Reports & Admin Operations)',
     database: dbStatus,
     timestamp: new Date().toISOString()
   });
@@ -1129,7 +1129,7 @@ app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/
 });
 
 // تعديل بيانات المستخدم (Admin Only)
-app.put(['/api/users/:id', '/api/admin/users/:id', '/api/admin/users/update'], authenticateToken, async (req, res) => {
+const handleUserUpdate = async (req, res) => {
   try {
     const actor = req.user;
     if ((actor.role || '').toUpperCase() !== 'ADMIN') {
@@ -1224,7 +1224,10 @@ app.put(['/api/users/:id', '/api/admin/users/:id', '/api/admin/users/update'], a
     console.error('Update User Error:', err);
     res.status(500).json({ error: 'حدث خطأ أثناء تعديل المستخدم: ' + (err.message || err) });
   }
-});
+};
+
+app.put(['/api/users/:id', '/api/admin/users/:id', '/api/admin/users/update'], authenticateToken, handleUserUpdate);
+app.post(['/api/admin/users/update', '/api/users/update', '/api/admin/users/:id/update', '/api/users/:id/update'], authenticateToken, handleUserUpdate);
 
 // ==============================================================================
 // 8. إدارة وتعديل وحذف أسطول العجلات (Fleet Management)
@@ -1265,15 +1268,20 @@ app.get(['/api/vehicles', '/api/admin/vehicles'], authenticateToken, async (req,
 });
 
 // تعديل عجلة وترحيل المعاملات تلقائياً (Admin & Management - Cascade Department Transfer)
-app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, async (req, res) => {
+const handleVehicleUpdate = async (req, res) => {
   const client = await pool.connect();
   try {
     const actor = req.user;
     if (!isManagementOrAdmin(actor.role)) {
+      client.release();
       return res.status(403).json({ error: 'صلاحية تعديل العجلات محصورة بالإدارة ومدير النظام' });
     }
 
-    const vehId = req.params.id;
+    const vehId = req.params.id || req.body.vehicle_id || req.body.id || req.body.plate_number;
+    if (!vehId) {
+      client.release();
+      return res.status(400).json({ error: 'معرف العجلة مطلوب' });
+    }
     const { plate_number, vehicle_type, department_id, current_km, is_active } = req.body;
 
     await client.query('BEGIN');
@@ -1378,7 +1386,8 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
       message: newDept && newDept !== oldDept 
         ? `تم تعديل بيانات العجلة وترحيل (${cascadedTransactionsCount}) معاملة صيانة إلى القسم الجديد بنجاح`
         : 'تم تعديل بيانات العجلة بنجاح',
-      vehicle: finalVehRes.rows[0]
+      vehicle: finalVehRes.rows[0],
+      data: finalVehRes.rows[0]
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1387,7 +1396,10 @@ app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, asy
   } finally {
     client.release();
   }
-});
+};
+
+app.put(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, handleVehicleUpdate);
+app.post(['/api/admin/vehicles/update', '/api/vehicles/update', '/api/admin/vehicles/:id/update', '/api/vehicles/:id/update'], authenticateToken, handleVehicleUpdate);
 
 // إضافة عجلة جديدة (Admin & Management)
 app.post(['/api/vehicles', '/api/admin/vehicles', '/api/admin/vehicles/add'], authenticateToken, async (req, res) => {
@@ -1545,6 +1557,91 @@ app.get('/api/reports/vehicle-history', authenticateToken, async (req, res) => {
   }
 });
 
+// تقرير الصيانة التجميعي للأدمن والإدارة حسب العجلة ونوع الصيانة (Axis 2 - Vehicle Category Summary Report)
+app.get(['/api/reports/vehicle-category-summary', '/api/reports/vehicle-categories-summary'], authenticateToken, async (req, res) => {
+  try {
+    const actor = req.user;
+    const actorRole = (actor.role || '').toUpperCase();
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'تقرير الصيانة التجميعي متاح حصرياً لمدير النظام والإدارة العامة' });
+    }
+
+    const { format, wheel_id, category } = req.query;
+
+    let query = `
+      SELECT 
+        COALESCE(v.plate_number, t.wheel_id) as plate_number,
+        COALESCE(v.vehicle_id, t.wheel_id) as vehicle_id,
+        COALESCE(v.department_id, t.department_id, 'DEPT-001') as department_id,
+        COALESCE(d.name, 'قسم النقل والآليات') as department_name,
+        COALESCE(t.category, 'صيانة عامة') as category,
+        MAX(COALESCE(t.mileage, 0)) as last_service_km,
+        MAX(COALESCE(t.mileage, 0)) + COALESCE(mc.default_replacement_km, 5000) as due_km,
+        MAX(t.created_at) as last_service_date,
+        COALESCE(SUM(t.cost), 0) as total_spent_for_category,
+        COUNT(t.id) as transactions_count
+      FROM transactions t
+      LEFT JOIN vehicles v ON (v.plate_number = t.wheel_id OR v.vehicle_id = t.wheel_id OR t.vehicle_numbers::text LIKE '%' || v.plate_number || '%')
+      LEFT JOIN departments d ON d.department_id = COALESCE(v.department_id, t.department_id)
+      LEFT JOIN maintenance_categories mc ON LOWER(mc.name) = LOWER(t.category)
+      WHERE (t.is_deleted = FALSE OR t.is_deleted IS NULL)
+    `;
+    const params = [];
+
+    if (wheel_id) {
+      params.push(wheel_id.trim());
+      query += ` AND (t.wheel_id = $${params.length} OR v.plate_number = $${params.length})`;
+    }
+
+    if (category) {
+      params.push(category.trim());
+      query += ` AND LOWER(t.category) = LOWER($${params.length})`;
+    }
+
+    query += `
+      GROUP BY COALESCE(v.plate_number, t.wheel_id), COALESCE(v.vehicle_id, t.wheel_id), COALESCE(v.department_id, t.department_id, 'DEPT-001'), d.name, t.category, mc.default_replacement_km
+      ORDER BY plate_number ASC, category ASC
+    `;
+
+    const result = await pool.query(query, params);
+    const rows = result.rows.map(r => ({
+      plate_number: r.plate_number,
+      wheel_id: r.plate_number,
+      category: r.category,
+      due_km: parseInt(r.due_km, 10) || 0,
+      last_service_km: parseInt(r.last_service_km, 10) || 0,
+      last_service_date: r.last_service_date,
+      total_spent_for_category: parseFloat(r.total_spent_for_category) || 0.0,
+      transactions_count: parseInt(r.transactions_count, 10) || 0,
+      department_id: r.department_id,
+      department_name: r.department_name
+    }));
+
+    // دعم التصدير المباشر لـ CSV/Excel
+    if (format === 'excel' || format === 'csv' || req.query.export === 'excel') {
+      let csv = '\ufeff"رقم العجلة","نوع الصيانة","كم استحقاق الصيانة","تاريخ آخر صيانة","إجمالي المبلغ المصروف لنوع الصيانة (د.ع)","القسم"\n';
+      for (const row of rows) {
+        const dateStr = row.last_service_date ? new Date(row.last_service_date).toLocaleDateString('ar-IQ') : '—';
+        csv += `"${row.plate_number}","${row.category}","${row.due_km} كم","${dateStr}","${row.total_spent_for_category.toLocaleString()}","${row.department_name}"\n`;
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="vehicle_category_summary_report.csv"');
+      return res.send(csv);
+    }
+
+    res.json({
+      success: true,
+      count: rows.length,
+      data: rows,
+      summary: rows,
+      report: rows
+    });
+  } catch (err) {
+    console.error('Vehicle Category Summary Report Error:', err);
+    res.status(500).json({ error: 'فشل استخراج تقرير الصيانة التجميعي: ' + (err.message || err) });
+  }
+});
+
 // ==============================================================================
 // 10. إدارة أنواع الصيانة والكم الافتراضي (Maintenance Categories API - Axis 1)
 // ==============================================================================
@@ -1569,7 +1666,7 @@ app.get(['/api/categories', '/api/maintenance-categories', '/api/admin/categorie
   res.json({ success: true, data: defaultList, categories: defaultList });
 });
 
-app.post(['/api/categories', '/api/maintenance-categories', '/api/admin/categories'], authenticateToken, async (req, res) => {
+app.post(['/api/categories', '/api/maintenance-categories', '/api/admin/categories', '/api/admin/categories/add'], authenticateToken, async (req, res) => {
   try {
     const actorRole = (req.user.role || '').toUpperCase();
     if (!isManagementOrAdmin(actorRole)) {
@@ -1581,10 +1678,13 @@ app.post(['/api/categories', '/api/maintenance-categories', '/api/admin/categori
     if (isNaN(km) || km <= 0) {
       return res.status(400).json({ error: 'الكم الافتراضي للاستبدال يجب أن يكون رقماً صحيحاً أكبر من الصفر' });
     }
-    const catId = 'CAT-' + crypto.randomUUID().slice(0, 8);
+    const catId = req.body.category_id || ('CAT-' + crypto.randomUUID().slice(0, 8));
     const r = await pool.query(
       `INSERT INTO maintenance_categories (category_id, name, default_replacement_km, created_at)
        VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (category_id) DO UPDATE SET 
+         name = EXCLUDED.name, 
+         default_replacement_km = EXCLUDED.default_replacement_km
        RETURNING *`,
       [catId, name.trim(), km]
     );
@@ -1594,14 +1694,16 @@ app.post(['/api/categories', '/api/maintenance-categories', '/api/admin/categori
   }
 });
 
-app.put(['/api/categories/:id', '/api/maintenance-categories/:id', '/api/admin/categories/:id'], authenticateToken, async (req, res) => {
+const handleCategoryUpdate = async (req, res) => {
   try {
     const actorRole = (req.user.role || '').toUpperCase();
     if (!isManagementOrAdmin(actorRole)) {
       return res.status(403).json({ error: 'صلاحية تعديل أنواع الصيانة محصورة بالإدارة ومدير النظام' });
     }
     const { name, default_replacement_km } = req.body;
-    const catId = req.params.id;
+    const catId = req.params.id || req.body.category_id || req.body.id;
+    if (!catId) return res.status(400).json({ error: 'معرف نوع الصيانة مطلوب' });
+
     let km = undefined;
     if (default_replacement_km !== undefined) {
       km = parseInt(default_replacement_km, 10);
@@ -1613,7 +1715,7 @@ app.put(['/api/categories/:id', '/api/maintenance-categories/:id', '/api/admin/c
       `UPDATE maintenance_categories 
        SET name = COALESCE($1, name), 
            default_replacement_km = COALESCE($2, default_replacement_km)
-       WHERE category_id = $3 OR id::text = $3
+       WHERE category_id = $3
        RETURNING *`,
       [name ? name.trim() : null, km, catId]
     );
@@ -1624,21 +1726,29 @@ app.put(['/api/categories/:id', '/api/maintenance-categories/:id', '/api/admin/c
   } catch (err) {
     res.status(500).json({ error: 'فشل تعديل نوع الصيانة: ' + (err.message || err) });
   }
-});
+};
 
-app.delete(['/api/categories/:id', '/api/maintenance-categories/:id', '/api/admin/categories/:id'], authenticateToken, async (req, res) => {
+app.put(['/api/categories/:id', '/api/maintenance-categories/:id', '/api/admin/categories/:id'], authenticateToken, handleCategoryUpdate);
+app.post(['/api/admin/categories/update', '/api/categories/update', '/api/admin/categories/:id/update'], authenticateToken, handleCategoryUpdate);
+
+const handleCategoryDelete = async (req, res) => {
   try {
     const actorRole = (req.user.role || '').toUpperCase();
     if (!isManagementOrAdmin(actorRole)) {
       return res.status(403).json({ error: 'صلاحية حذف أنواع الصيانة محصورة بالإدارة ومدير النظام' });
     }
-    const catId = req.params.id;
-    await pool.query('DELETE FROM maintenance_categories WHERE category_id = $1 OR id::text = $1', [catId]);
+    const catId = req.params.id || req.body.category_id || req.body.id;
+    if (!catId) return res.status(400).json({ error: 'معرف نوع الصيانة مطلوب' });
+
+    await pool.query('DELETE FROM maintenance_categories WHERE category_id = $1', [catId]);
     res.json({ success: true, message: 'تم حذف نوع الصيانة بنجاح' });
   } catch (err) {
     res.status(500).json({ error: 'فشل حذف نوع الصيانة' });
   }
-});
+};
+
+app.delete(['/api/categories/:id', '/api/maintenance-categories/:id', '/api/admin/categories/:id'], authenticateToken, handleCategoryDelete);
+app.post(['/api/admin/categories/delete', '/api/categories/delete', '/api/admin/categories/:id/delete'], authenticateToken, handleCategoryDelete);
 
 // ==============================================================================
 // 11. مركز وإدارة الإشعارات الفورية والموجهة (Notifications Center API)
@@ -1815,7 +1925,7 @@ async function executeSoftDelete(req, res, { tableName, idColumn, entityType, re
     // 1. إدراج لقطة كاملة في جدول المحذوفات
     await pool.query(
       `INSERT INTO deleted_records (entity_type, entity_id, record_snapshot, deleted_by, deleted_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
       [entityType, String(recordId), JSON.stringify(recordSnapshot), actor.full_name || actor.username]
     );
 
@@ -1833,9 +1943,12 @@ async function executeSoftDelete(req, res, { tableName, idColumn, entityType, re
 }
 
 // حذف مستخدم (يمنع حذف الحساب الشخصي أو حساب admin الرئيسي)
-app.delete(['/api/users/:id', '/api/admin/users/:id'], authenticateToken, (req, res) => {
-  const targetId = req.params.id;
+const handleUserDelete = (req, res) => {
+  const targetId = req.params.id || req.body.user_id || req.body.id;
   const actorId = req.user.id || req.user.user_id;
+  if (!targetId) {
+    return res.status(400).json({ error: 'معرف المستخدم مطلوب للحذف' });
+  }
   if (String(targetId) === String(actorId) || targetId === 'USR-ADMIN-001' || targetId === 'admin') {
     return res.status(400).json({ error: 'لا يمكنك حذف حسابك الشخصي أو حساب مدير النظام الرئيسي' });
   }
@@ -1846,19 +1959,70 @@ app.delete(['/api/users/:id', '/api/admin/users/:id'], authenticateToken, (req, 
     recordId: targetId,
     successMsg: 'تم نقل المستخدم إلى جدول المحذوفات بنجاح'
   });
+};
+
+app.delete(['/api/users/:id', '/api/admin/users/:id'], authenticateToken, handleUserDelete);
+app.post(['/api/admin/users/delete', '/api/users/delete', '/api/admin/users/:id/delete', '/api/users/:id/delete'], authenticateToken, handleUserDelete);
+
+// تفعيل/تعطيل المستخدم (Toggle User Active)
+app.post(['/api/admin/users/toggle-active', '/api/users/toggle-active'], authenticateToken, async (req, res) => {
+  try {
+    const actorRole = (req.user.role || '').toUpperCase();
+    if (!isAdminRole(actorRole)) {
+      return res.status(403).json({ error: 'صلاحية تغيير حالة المستخدم محصورة بمدير النظام' });
+    }
+    const userId = req.body.user_id || req.body.id;
+    if (!userId) return res.status(400).json({ error: 'معرف المستخدم مطلوب' });
+    if (userId === req.user.id || userId === req.user.user_id || userId === 'USR-ADMIN-001' || userId === 'admin') {
+      return res.status(400).json({ error: 'لا يمكن تعطيل حسابك أو حساب مدير النظام الرئيسي' });
+    }
+    const r = await pool.query(
+      `UPDATE users SET is_active = NOT is_active, updated_at = NOW() WHERE user_id = $1 RETURNING user_id, username, full_name, is_active`,
+      [userId]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'المستخدم غير موجود' });
+    res.json({ success: true, message: 'تم تغيير حالة تفعيل المستخدم بنجاح', user: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل تغيير حالة المستخدم: ' + (err.message || err) });
+  }
+});
+
+// تفعيل/تعطيل العجلة (Toggle Vehicle Active)
+app.post(['/api/admin/vehicles/toggle-active', '/api/vehicles/toggle-active'], authenticateToken, async (req, res) => {
+  try {
+    const actorRole = (req.user.role || '').toUpperCase();
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'صلاحية تغيير حالة العجلة محصورة بالإدارة ومدير النظام' });
+    }
+    const vehId = req.body.vehicle_id || req.body.id || req.body.plate_number;
+    if (!vehId) return res.status(400).json({ error: 'معرف العجلة مطلوب' });
+    const r = await pool.query(
+      `UPDATE vehicles SET is_active = NOT is_active, updated_at = NOW() WHERE vehicle_id = $1 OR plate_number = $1 RETURNING *`,
+      [vehId]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'العجلة غير موجودة' });
+    res.json({ success: true, message: 'تم تغيير حالة تفعيل العجلة بنجاح', vehicle: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل تغيير حالة العجلة: ' + (err.message || err) });
+  }
 });
 
 // حذف شامل للعجلة وكافة متعلقاتها ومعاملاتها (Admin Only - Cascade Delete - Axis 2)
-app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, async (req, res) => {
+const handleVehicleDelete = async (req, res) => {
   const client = await pool.connect();
   try {
     const actor = req.user;
     const actorRole = (actor.role || '').toUpperCase();
     if (actorRole !== 'ADMIN') {
+      client.release();
       return res.status(403).json({ error: 'صلاحية حذف العجلات محصورة بمدير النظام (ADMIN) فقط' });
     }
 
-    const vehId = req.params.id;
+    const vehId = req.params.id || req.body.vehicle_id || req.body.id || req.body.plate_number;
+    if (!vehId) {
+      client.release();
+      return res.status(400).json({ error: 'معرف العجلة مطلوب للحذف' });
+    }
     await client.query('BEGIN');
 
     // 1. جلب بيانات العجلة
@@ -1936,7 +2100,10 @@ app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, 
   } finally {
     client.release();
   }
-});
+};
+
+app.delete(['/api/vehicles/:id', '/api/admin/vehicles/:id'], authenticateToken, handleVehicleDelete);
+app.post(['/api/admin/vehicles/delete', '/api/vehicles/delete', '/api/admin/vehicles/:id/delete', '/api/vehicles/:id/delete'], authenticateToken, handleVehicleDelete);
 
 // حذف معاملة
 app.delete('/api/transactions/:id', authenticateToken, (req, res) =>
