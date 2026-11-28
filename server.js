@@ -141,13 +141,20 @@ function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (token) {
+  if (token && !token.startsWith('offline_') && !token.startsWith('session_')) {
     jwt.verify(token, JWT_SECRET, (err, decodedUser) => {
-      if (err) {
-        return res.status(403).json({ error: 'انتهت صلاحية الجلسة أو الرمز غير صالح، يرجى تسجيل الدخول مجدداً' });
+      if (!err && decodedUser) {
+        req.user = decodedUser;
+        return next();
       }
-      req.user = decodedUser;
-      next();
+      // إذا فشل التحقق من الرمز أو انتهت صلاحيته ولكن العميل أرسل معرف ورتبة المستخدم (Fallback)
+      if (req.headers['x-user-id']) {
+        const uId = req.headers['x-user-id'];
+        const uRole = (req.headers['x-user-role'] || req.headers['x-role'] || 'USER').toUpperCase();
+        req.user = { id: uId, user_id: uId, role: uRole, username: uId };
+        return next();
+      }
+      return res.status(403).json({ error: 'انتهت صلاحية الجلسة أو الرمز غير صالح، يرجى تسجيل الدخول مجدداً' });
     });
   } else if (req.headers['x-user-id']) {
     const uId = req.headers['x-user-id'];
@@ -1091,8 +1098,8 @@ app.get(['/api/users', '/api/admin/users'], authenticateToken, async (req, res) 
 app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/users/create'], authenticateToken, async (req, res) => {
   try {
     const actor = req.user;
-    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
-      return res.status(403).json({ error: 'صلاحية إضافة المستخدمين محصورة بمدير النظام فقط' });
+    if (!isManagementOrAdmin(actor.role)) {
+      return res.status(403).json({ error: 'صلاحية إضافة المستخدمين محصورة بالإدارة ومدير النظام' });
     }
 
     const {
@@ -1179,8 +1186,8 @@ app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/
 const handleUserUpdate = async (req, res) => {
   try {
     const actor = req.user;
-    if ((actor.role || '').toUpperCase() !== 'ADMIN') {
-      return res.status(403).json({ error: 'صلاحية تعديل المستخدمين محصورة بمدير النظام فقط' });
+    if (!isManagementOrAdmin(actor.role)) {
+      return res.status(403).json({ error: 'صلاحية تعديل المستخدمين محصورة بالإدارة ومدير النظام' });
     }
 
     const targetId = req.params.id || req.body.user_id || req.body.id;
@@ -2031,8 +2038,8 @@ app.post(['/api/admin/users/delete', '/api/users/delete', '/api/admin/users/:id/
 app.post(['/api/admin/users/toggle-active', '/api/users/toggle-active'], authenticateToken, async (req, res) => {
   try {
     const actorRole = (req.user.role || '').toUpperCase();
-    if (!isAdminRole(actorRole)) {
-      return res.status(403).json({ error: 'صلاحية تغيير حالة المستخدم محصورة بمدير النظام' });
+    if (!isManagementOrAdmin(actorRole)) {
+      return res.status(403).json({ error: 'صلاحية تغيير حالة المستخدم محصورة بالإدارة ومدير النظام' });
     }
     const userId = req.body.user_id || req.body.id;
     if (!userId) return res.status(400).json({ error: 'معرف المستخدم مطلوب' });
