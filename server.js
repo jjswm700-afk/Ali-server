@@ -344,6 +344,33 @@ async function checkAndTriggerOverdueAlerts(wheelId, currentMileage, submitterUs
             );
           }
         }
+
+        // إرسال لإدارة النظام (ADMIN & MANAGEMENT) - v7.0
+        try {
+          const adminUsersRes = await pool.query(
+            `SELECT user_id FROM users 
+             WHERE UPPER(role) IN ('ADMIN', 'MANAGEMENT')
+               AND is_active = TRUE AND (is_deleted = FALSE OR is_deleted IS NULL)`
+          );
+          for (const adm of adminUsersRes.rows) {
+            if (adm.user_id !== submitterUserId && !deptHeadIds.includes(adm.user_id)) {
+              await sendNotification(
+                adm.user_id,
+                excludeTxId,
+                alertTitle,
+                alertPurpose,
+                alertMessage,
+                'WARNING',
+                'TARGET_USER',
+                adm.user_id,
+                'SYSTEM',
+                'منظومة الصيانة الذكية'
+              );
+            }
+          }
+        } catch (eAdm) {
+          console.warn('Overdue Admin notification dispatch error:', eAdm.message);
+        }
       }
     }
   } catch (err) {
@@ -366,7 +393,7 @@ app.get(['/api/health', '/api/ping'], async (req, res) => {
   res.json({
     status: 'online',
     system: 'Wheel Maintenance Cloud API',
-    version: '6.2.0 (Category Management, Aggregated Reports & Admin Operations)',
+    version: '7.0.0 (Final QA Audit, Reactive Binding & APK Optimization)',
     database: dbStatus,
     timestamp: new Date().toISOString()
   });
@@ -384,7 +411,9 @@ app.post(['/api/auth/login', '/api/login'], async (req, res) => {
 
     const cleanUser = String(username).trim();
     const query = `
-      SELECT u.*, d.name as department_name 
+      SELECT u.*, 
+             COALESCE(d.name, u.department_id) as department_name,
+             COALESCE(d.name, u.department_id) as department
       FROM users u
       LEFT JOIN departments d ON u.department_id = d.department_id
       WHERE (u.user_id = $1 OR LOWER(u.username) = LOWER($1)) AND (u.is_deleted = FALSE OR u.is_deleted IS NULL)
@@ -414,6 +443,7 @@ app.post(['/api/auth/login', '/api/login'], async (req, res) => {
       role: user.role,
       department_id: user.department_id,
       department_name: user.department_name || '',
+      department: user.department_name || user.department_id || '',
       unit: user.unit || '',
       is_department_manager: user.is_department_manager || false,
       assigned_department_id: user.assigned_department_id || null,
@@ -453,7 +483,8 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     const userRes = await pool.query(
       `SELECT u.user_id, u.username, u.full_name, u.role, u.department_id, u.unit, u.is_read_only, 
               u.can_add_transaction, u.is_department_manager, u.assigned_department_id,
-              d.name as department_name
+              COALESCE(d.name, u.department_id) as department_name,
+              COALESCE(d.name, u.department_id) as department
        FROM users u
        LEFT JOIN departments d ON u.department_id = d.department_id
        WHERE u.user_id = $1 AND u.is_deleted = FALSE`,
@@ -1037,7 +1068,8 @@ app.get(['/api/users', '/api/admin/users'], authenticateToken, async (req, res) 
       `SELECT u.user_id, u.username, u.full_name, u.role, u.department_id, u.unit, u.is_active, 
               u.is_read_only, u.can_add_transaction, u.is_department_manager, 
               u.assigned_department_id, u.can_add_dept_members_transactions, u.is_deleted, u.created_at,
-              d.name as department_name
+              COALESCE(d.name, u.department_id) as department_name,
+              COALESCE(d.name, u.department_id) as department
        FROM users u
        LEFT JOIN departments d ON u.department_id = d.department_id
        WHERE u.is_deleted = FALSE 
@@ -1095,14 +1127,12 @@ app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/
     const newUserId = user_id || ('USR-' + crypto.randomBytes(3).toString('hex').toUpperCase());
     const passHash = hashPassword(password || '123');
 
-    const insertRes = await pool.query(
+    await pool.query(
       `INSERT INTO users (
         user_id, username, password_hash, full_name, role, department_id, unit,
         is_active, is_read_only, can_add_transaction, is_department_manager,
         assigned_department_id, can_add_dept_members_transactions, is_deleted, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, NOW())
-      RETURNING user_id, username, full_name, role, department_id, unit, is_active,
-                is_read_only, can_add_transaction, is_department_manager, assigned_department_id`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, NOW())`,
       [
         newUserId,
         cleanUsername,
@@ -1120,8 +1150,20 @@ app.post(['/api/users', '/api/admin/users', '/api/admin/users/add', '/api/admin/
       ]
     );
 
+    const fullUserRes = await pool.query(
+      `SELECT u.user_id, u.username, u.full_name, u.role, u.department_id, u.unit, u.is_active, 
+              u.is_read_only, u.can_add_transaction, u.is_department_manager, 
+              u.assigned_department_id, u.can_add_dept_members_transactions, u.is_deleted, u.created_at,
+              COALESCE(d.name, u.department_id) as department_name,
+              COALESCE(d.name, u.department_id) as department
+       FROM users u
+       LEFT JOIN departments d ON u.department_id = d.department_id
+       WHERE u.user_id = $1`,
+      [newUserId]
+    );
+
     await logAudit('CREATE_USER', 'users', newUserId, actor.id || actor.user_id, actor.full_name, { username: cleanUsername });
-    res.status(201).json({ success: true, message: 'تم حفظ المستخدم بنجاح', user: insertRes.rows[0] });
+    res.status(201).json({ success: true, message: 'تم حفظ المستخدم بنجاح', user: fullUserRes.rows[0], data: fullUserRes.rows[0] });
   } catch (err) {
     console.error('Create User Error:', err);
     res.status(500).json({ error: 'حدث خطأ أثناء حفظ المستخدم: ' + (err.message || err) });
@@ -1215,11 +1257,23 @@ const handleUserUpdate = async (req, res) => {
     }
 
     values.push(targetId);
-    const q = `UPDATE users SET ${updates.join(', ')} WHERE user_id = $${idx} RETURNING user_id, username, full_name, role, department_id, unit, is_active`;
-    const updRes = await pool.query(q, values);
+    const q = `UPDATE users SET ${updates.join(', ')} WHERE user_id = $${idx}`;
+    await pool.query(q, values);
+
+    const fullUserRes = await pool.query(
+      `SELECT u.user_id, u.username, u.full_name, u.role, u.department_id, u.unit, u.is_active, 
+              u.is_read_only, u.can_add_transaction, u.is_department_manager, 
+              u.assigned_department_id, u.can_add_dept_members_transactions, u.is_deleted, u.created_at,
+              COALESCE(d.name, u.department_id) as department_name,
+              COALESCE(d.name, u.department_id) as department
+       FROM users u
+       LEFT JOIN departments d ON u.department_id = d.department_id
+       WHERE u.user_id = $1`,
+      [targetId]
+    );
 
     await logAudit('UPDATE_USER', 'users', targetId, actor.id || actor.user_id, actor.full_name, req.body);
-    res.json({ success: true, message: 'تم تعديل بيانات المستخدم بنجاح', user: updRes.rows[0] });
+    res.json({ success: true, message: 'تم تعديل بيانات المستخدم بنجاح', user: fullUserRes.rows[0], data: fullUserRes.rows[0] });
   } catch (err) {
     console.error('Update User Error:', err);
     res.status(500).json({ error: 'حدث خطأ أثناء تعديل المستخدم: ' + (err.message || err) });
