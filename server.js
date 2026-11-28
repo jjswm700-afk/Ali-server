@@ -529,7 +529,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     }
 
     // استنتاج القسم تلقائياً من المستخدم
-    const userDept = user.assigned_department_id || user.department_id || req.body.department_id;
+    const userDept = user.department_id || user.assigned_department_id || req.body.department_id;
     if (!userDept) {
       return res.status(400).json({ error: 'المستخدم غير مرتبط بأي قسم، يرجى مراجعة مدير النظام لربط الحساب بقسم صالح.' });
     }
@@ -565,7 +565,12 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       });
     }
 
-    if (existingVeh.department_id && existingVeh.department_id !== userDept && !isManagementOrAdmin(normalizedRole)) {
+    const isDeptMatch = !existingVeh.department_id ||
+      existingVeh.department_id === userDept ||
+      existingVeh.department_id === user.department_id ||
+      existingVeh.department_id === user.assigned_department_id;
+
+    if (!isDeptMatch && !isManagementOrAdmin(normalizedRole)) {
       return res.status(400).json({ 
         error: `عذراً، رقم العجلة (${wheelId}) غير مسجل أو لا يتبع لقسمك.` 
       });
@@ -1222,6 +1227,10 @@ const handleUserUpdate = async (req, res) => {
     if (department_id !== undefined) {
       updates.push(`department_id = $${idx++}`);
       values.push(department_id || null);
+      if (assigned_department_id === undefined) {
+        updates.push(`assigned_department_id = $${idx++}`);
+        values.push(department_id || null);
+      }
     }
     if (unit !== undefined) {
       updates.push(`unit = $${idx++}`);
